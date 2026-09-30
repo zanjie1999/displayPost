@@ -31,84 +31,64 @@ struct Fb {
     int bpp = 0;
     int stride = 0;
 
-    int ro = 0;
-    int rl = 0;
+    int redOffset = 0;
+    int redLength = 0;
+    int greenOffset = 0;
+    int greenLength = 0;
+    int blueOffset = 0;
+    int blueLength = 0;
+    int alphaOffset = 0;
+    int alphaLength = 0;
 
-    int go = 0;
-    int gl = 0;
-
-    int bo = 0;
-    int bl = 0;
-
-    int ao = 0;
-    int al = 0;
-
-    size_t size = 0;
-
-    std::string fmt;
+    size_t frameSize = 0;
+    std::string format;
 };
 
 struct Url {
     std::wstring host;
     std::wstring path;
-
     INTERNET_PORT port = 0;
     bool tls = false;
 };
 
 static bool Crack(const std::wstring& input, Url& out) {
-    URL_COMPONENTS c{};
-
-    c.dwStructSize = sizeof(c);
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
 
     wchar_t host[256]{};
     wchar_t path[4096]{};
 
-    c.lpszHostName = host;
-    c.dwHostNameLength = _countof(host);
-
-    c.lpszUrlPath = path;
-    c.dwUrlPathLength = _countof(path);
+    components.lpszHostName = host;
+    components.dwHostNameLength = _countof(host);
+    components.lpszUrlPath = path;
+    components.dwUrlPathLength = _countof(path);
 
     if (!WinHttpCrackUrl(
             input.c_str(),
             0,
             0,
-            &c)) {
+            &components)) {
         return false;
     }
 
-    out.host.assign(host, c.dwHostNameLength);
-    out.path.assign(path, c.dwUrlPathLength);
-
-    /*
-        Normalize the base URL.
-
-        These are all treated as the same base:
-
-            http://192.168.2.195:8080
-            http://192.168.2.195:8080/
-            http://192.168.2.195:8080/fb
-
-        Recommended input is the first one.
-    */
+    out.host.assign(host, components.dwHostNameLength);
+    out.path.assign(path, components.dwUrlPathLength);
 
     if (out.path.empty() || out.path == L"/") {
         out.path.clear();
     }
 
-    while (out.path.size() > 1 &&
-           out.path.back() == L'/') {
+    while (out.path.size() > 1 && out.path.back() == L'/') {
         out.path.pop_back();
     }
 
+    // Keep compatibility with the old accidental /fb base URL.
     if (out.path == L"/fb") {
         out.path.clear();
     }
 
-    out.port = c.nPort;
-    out.tls = c.nScheme == INTERNET_SCHEME_HTTPS;
-
+    out.port = components.nPort;
+    out.tls = components.nScheme == INTERNET_SCHEME_HTTPS;
     return true;
 }
 
@@ -116,11 +96,11 @@ static std::wstring JoinPath(
     const std::wstring& base,
     const std::wstring& relative) {
 
-    if (relative.empty()) {
+    std::wstring rel = relative;
+
+    if (rel.empty()) {
         return base.empty() ? L"/" : base;
     }
-
-    std::wstring rel = relative;
 
     if (rel.front() != L'/') {
         rel.insert(rel.begin(), L'/');
@@ -141,14 +121,13 @@ static long ReadNumber(
     const std::string& json,
     const char* key) {
 
-    std::regex re(
-        std::string("\"") +
-        key +
+    std::regex expression(
+        std::string("\"") + key +
         "\"\\s*:\\s*([0-9]+)");
 
     std::smatch match;
 
-    if (!std::regex_search(json, match, re)) {
+    if (!std::regex_search(json, match, expression)) {
         throw std::runtime_error(
             std::string("fbinfo missing ") + key);
     }
@@ -160,14 +139,13 @@ static std::string ReadString(
     const std::string& json,
     const char* key) {
 
-    std::regex re(
-        std::string("\"") +
-        key +
+    std::regex expression(
+        std::string("\"") + key +
         "\"\\s*:\\s*\"([^\"]*)\"");
 
     std::smatch match;
 
-    if (!std::regex_search(json, match, re)) {
+    if (!std::regex_search(json, match, expression)) {
         throw std::runtime_error(
             std::string("fbinfo missing ") + key);
     }
@@ -176,17 +154,17 @@ static std::string ReadString(
 }
 
 static std::string HttpGet(
-    const std::wstring& base,
-    const std::wstring& relative) {
+    const std::wstring& baseUrl,
+    const std::wstring& relativePath) {
 
     Url url;
 
-    if (!Crack(base, url)) {
-        throw std::runtime_error("bad url");
+    if (!Crack(baseUrl, url)) {
+        throw std::runtime_error("bad URL");
     }
 
     HINTERNET session = WinHttpOpen(
-        L"displayPost/0.3",
+        L"displayPost/0.5",
         WINHTTP_ACCESS_TYPE_NO_PROXY,
         nullptr,
         nullptr,
@@ -211,7 +189,7 @@ static std::string HttpGet(
         }
 
         const std::wstring requestPath =
-            JoinPath(url.path, relative);
+            JoinPath(url.path, relativePath);
 
         request = WinHttpOpenRequest(
             connect,
@@ -220,9 +198,7 @@ static std::string HttpGet(
             nullptr,
             WINHTTP_NO_REFERER,
             WINHTTP_DEFAULT_ACCEPT_TYPES,
-            url.tls
-                ? WINHTTP_FLAG_SECURE
-                : 0);
+            url.tls ? WINHTTP_FLAG_SECURE : 0);
 
         if (!request) {
             throw std::runtime_error(
@@ -241,15 +217,12 @@ static std::string HttpGet(
                 "GET WinHttpSendRequest failed");
         }
 
-        if (!WinHttpReceiveResponse(
-                request,
-                nullptr)) {
+        if (!WinHttpReceiveResponse(request, nullptr)) {
             throw std::runtime_error(
                 "GET WinHttpReceiveResponse failed");
         }
 
         std::string result;
-
         char buffer[8192];
 
         for (;;) {
@@ -268,9 +241,7 @@ static std::string HttpGet(
                 break;
             }
 
-            result.append(
-                buffer,
-                buffer + bytesRead);
+            result.append(buffer, buffer + bytesRead);
         }
 
         WinHttpCloseHandle(request);
@@ -283,20 +254,15 @@ static std::string HttpGet(
         if (request) {
             WinHttpCloseHandle(request);
         }
-
         if (connect) {
             WinHttpCloseHandle(connect);
         }
-
         WinHttpCloseHandle(session);
-
         throw;
     }
 }
 
-static Fb ReadFbInfo(
-    const std::wstring& url) {
-
+static Fb ReadFbInfo(const std::wstring& url) {
     const std::string json =
         HttpGet(url, L"/fbinfo");
 
@@ -314,40 +280,36 @@ static Fb ReadFbInfo(
     fb.stride = static_cast<int>(
         ReadNumber(json, "stride"));
 
-    fb.size = static_cast<size_t>(
+    fb.frameSize = static_cast<size_t>(
         ReadNumber(json, "frame_size"));
 
-    fb.fmt =
+    fb.format =
         ReadString(json, "format");
 
-    fb.ro = static_cast<int>(
+    fb.redOffset = static_cast<int>(
         ReadNumber(json, "red_offset"));
-
-    fb.rl = static_cast<int>(
+    fb.redLength = static_cast<int>(
         ReadNumber(json, "red_length"));
 
-    fb.go = static_cast<int>(
+    fb.greenOffset = static_cast<int>(
         ReadNumber(json, "green_offset"));
-
-    fb.gl = static_cast<int>(
+    fb.greenLength = static_cast<int>(
         ReadNumber(json, "green_length"));
 
-    fb.bo = static_cast<int>(
+    fb.blueOffset = static_cast<int>(
         ReadNumber(json, "blue_offset"));
-
-    fb.bl = static_cast<int>(
+    fb.blueLength = static_cast<int>(
         ReadNumber(json, "blue_length"));
 
-    fb.ao = static_cast<int>(
+    fb.alphaOffset = static_cast<int>(
         ReadNumber(json, "alpha_offset"));
-
-    fb.al = static_cast<int>(
+    fb.alphaLength = static_cast<int>(
         ReadNumber(json, "alpha_length"));
 
     if (fb.w <= 0 ||
         fb.h <= 0 ||
         fb.stride <= 0 ||
-        fb.size == 0) {
+        fb.frameSize == 0) {
         throw std::runtime_error(
             "invalid framebuffer geometry");
     }
@@ -357,12 +319,15 @@ static Fb ReadFbInfo(
         fb.bpp != 24 &&
         fb.bpp != 32) {
         throw std::runtime_error(
-            "unsupported framebuffer bpp");
+            "unsupported framebuffer bpp: " +
+            std::to_string(fb.bpp));
     }
 
-    const size_t minimumStride =
-        static_cast<size_t>(fb.w) *
+    const size_t bytesPerPixel =
         static_cast<size_t>(fb.bpp / 8);
+
+    const size_t minimumStride =
+        static_cast<size_t>(fb.w) * bytesPerPixel;
 
     const size_t minimumFrameSize =
         static_cast<size_t>(fb.stride) *
@@ -373,7 +338,7 @@ static Fb ReadFbInfo(
             "invalid framebuffer stride");
     }
 
-    if (fb.size < minimumFrameSize) {
+    if (fb.frameSize < minimumFrameSize) {
         throw std::runtime_error(
             "invalid framebuffer frame_size");
     }
@@ -399,18 +364,12 @@ static BOOL CALLBACK EnumMonitorProc(
     MONITORINFO info{};
     info.cbSize = sizeof(info);
 
-    if (GetMonitorInfoW(
-            monitor,
-            &info)) {
-
-        MonitorInfo m;
-
-        m.rect = info.rcMonitor;
-        m.primary =
-            (info.dwFlags &
-             MONITORINFOF_PRIMARY) != 0;
-
-        monitors->push_back(m);
+    if (GetMonitorInfoW(monitor, &info)) {
+        MonitorInfo item;
+        item.rect = info.rcMonitor;
+        item.primary =
+            (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        monitors->push_back(item);
     }
 
     return TRUE;
@@ -425,19 +384,12 @@ static std::vector<MonitorInfo> EnumerateMonitors() {
         EnumMonitorProc,
         reinterpret_cast<LPARAM>(&monitors));
 
-    /*
-        Keep the primary monitor first.
-
-        This gives monitor=1 the normal meaning
-        of "the first/main display".
-    */
-
+    // Primary display becomes monitor 1.
     std::stable_sort(
         monitors.begin(),
         monitors.end(),
         [](const MonitorInfo& a,
            const MonitorInfo& b) {
-
             return a.primary > b.primary;
         });
 
@@ -448,16 +400,13 @@ class JpegEncoder {
     ULONG_PTR gdiplusToken_ = 0;
     CLSID jpegClsid_{};
 
-    static bool FindJpegEncoder(
-        CLSID& clsid) {
-
+    static bool FindJpegEncoder(CLSID& clsid) {
         UINT encoderCount = 0;
         UINT encoderBytes = 0;
 
         if (Gdiplus::GetImageEncodersSize(
                 &encoderCount,
-                &encoderBytes) !=
-            Gdiplus::Ok) {
+                &encoderBytes) != Gdiplus::Ok) {
             return false;
         }
 
@@ -465,31 +414,24 @@ class JpegEncoder {
             return false;
         }
 
-        std::vector<BYTE> buffer(
-            encoderBytes);
+        std::vector<BYTE> buffer(encoderBytes);
 
         auto* encoders =
-            reinterpret_cast<
-                Gdiplus::ImageCodecInfo*>(
+            reinterpret_cast<Gdiplus::ImageCodecInfo*>(
                 buffer.data());
 
         if (Gdiplus::GetImageEncoders(
                 encoderCount,
                 encoderBytes,
-                encoders) !=
-            Gdiplus::Ok) {
+                encoders) != Gdiplus::Ok) {
             return false;
         }
 
-        for (UINT i = 0;
-             i < encoderCount;
-             ++i) {
-
+        for (UINT i = 0; i < encoderCount; ++i) {
             if (encoders[i].MimeType &&
                 std::wcscmp(
                     encoders[i].MimeType,
                     L"image/jpeg") == 0) {
-
                 clsid = encoders[i].Clsid;
                 return true;
             }
@@ -514,7 +456,6 @@ public:
             if (gdiplusToken_) {
                 Gdiplus::GdiplusShutdown(
                     gdiplusToken_);
-
                 gdiplusToken_ = 0;
             }
 
@@ -544,15 +485,7 @@ public:
             return false;
         }
 
-        /*
-            CreateDIBSection(BI_RGB, 32bpp) stores:
-
-                B G R 0
-
-            which is compatible with GDI+'s
-            PixelFormat32bppRGB memory layout.
-        */
-
+        // CreateDIBSection with BI_RGB stores B,G,R,0.
         Gdiplus::Bitmap bitmap(
             width,
             height,
@@ -560,56 +493,43 @@ public:
             PixelFormat32bppRGB,
             const_cast<BYTE*>(pixels));
 
-        if (bitmap.GetLastStatus() !=
-            Gdiplus::Ok) {
+        if (bitmap.GetLastStatus() != Gdiplus::Ok) {
             return false;
         }
 
         IStream* stream = nullptr;
 
-        if (FAILED(
-                CreateStreamOnHGlobal(
-                    nullptr,
-                    TRUE,
-                    &stream))) {
+        if (FAILED(CreateStreamOnHGlobal(
+                nullptr,
+                TRUE,
+                &stream))) {
             return false;
         }
 
         ULONG quality = 80;
 
         Gdiplus::EncoderParameters parameters{};
-
         parameters.Count = 1;
-
         parameters.Parameter[0].Guid =
             Gdiplus::EncoderQuality;
-
         parameters.Parameter[0].Type =
             Gdiplus::EncoderParameterValueTypeLong;
-
         parameters.Parameter[0].NumberOfValues = 1;
+        parameters.Parameter[0].Value = &quality;
 
-        parameters.Parameter[0].Value =
-            &quality;
-
-        const Gdiplus::Status saveStatus =
-            bitmap.Save(
+        if (bitmap.Save(
                 stream,
                 &jpegClsid_,
-                &parameters);
-
-        if (saveStatus != Gdiplus::Ok) {
+                &parameters) != Gdiplus::Ok) {
             stream->Release();
             return false;
         }
 
         STATSTG stat{};
 
-        if (FAILED(
-                stream->Stat(
-                    &stat,
-                    STATFLAG_NONAME))) {
-
+        if (FAILED(stream->Stat(
+                &stat,
+                STATFLAG_NONAME))) {
             stream->Release();
             return false;
         }
@@ -618,20 +538,17 @@ public:
             static_cast<unsigned long long>(
                 stat.cbSize.QuadPart) >
                 std::numeric_limits<size_t>::max()) {
-
             stream->Release();
             return false;
         }
 
         const size_t size =
-            static_cast<size_t>(
-                stat.cbSize.QuadPart);
+            static_cast<size_t>(stat.cbSize.QuadPart);
 
         if (size == 0 ||
             size >
                 static_cast<size_t>(
                     std::numeric_limits<ULONG>::max())) {
-
             stream->Release();
             return false;
         }
@@ -640,12 +557,10 @@ public:
 
         LARGE_INTEGER zero{};
 
-        if (FAILED(
-                stream->Seek(
-                    zero,
-                    STREAM_SEEK_SET,
-                    nullptr))) {
-
+        if (FAILED(stream->Seek(
+                zero,
+                STREAM_SEEK_SET,
+                nullptr))) {
             stream->Release();
             jpeg.clear();
             return false;
@@ -653,7 +568,7 @@ public:
 
         ULONG bytesRead = 0;
 
-        const HRESULT readResult =
+        const HRESULT result =
             stream->Read(
                 jpeg.data(),
                 static_cast<ULONG>(jpeg.size()),
@@ -661,15 +576,13 @@ public:
 
         stream->Release();
 
-        if (FAILED(readResult) ||
-            static_cast<size_t>(bytesRead) !=
-                jpeg.size()) {
-
+        if (FAILED(result) ||
+            static_cast<size_t>(bytesRead) != jpeg.size()) {
             jpeg.clear();
             return false;
         }
 
-        return !jpeg.empty();
+        return true;
     }
 };
 
@@ -687,9 +600,7 @@ class Capture {
 public:
     ~Capture() {
         if (dc_ && oldBitmap_) {
-            SelectObject(
-                dc_,
-                oldBitmap_);
+            SelectObject(dc_, oldBitmap_);
         }
 
         if (bitmap_) {
@@ -701,83 +612,54 @@ public:
         }
 
         if (screen_) {
-            ReleaseDC(
-                nullptr,
-                screen_);
+            ReleaseDC(nullptr, screen_);
         }
     }
 
     bool Init(const Fb& fb) {
         fb_ = fb;
 
-        screen_ =
-            GetDC(nullptr);
-
+        screen_ = GetDC(nullptr);
         if (!screen_) {
             return false;
         }
 
-        dc_ =
-            CreateCompatibleDC(screen_);
-
+        dc_ = CreateCompatibleDC(screen_);
         if (!dc_) {
             return false;
         }
 
-        BITMAPINFO bitmapInfo{};
-
-        bitmapInfo.bmiHeader.biSize =
+        BITMAPINFO info{};
+        info.bmiHeader.biSize =
             sizeof(BITMAPINFOHEADER);
-
-        bitmapInfo.bmiHeader.biWidth =
+        info.bmiHeader.biWidth =
             fb.w;
+        info.bmiHeader.biHeight =
+            -fb.h; // top-down DIB
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
 
-        /*
-            Negative height means top-down DIB.
-
-            This makes row 0 correspond to
-            the top of the image.
-        */
-
-        bitmapInfo.bmiHeader.biHeight =
-            -fb.h;
-
-        bitmapInfo.bmiHeader.biPlanes =
-            1;
-
-        bitmapInfo.bmiHeader.biBitCount =
-            32;
-
-        bitmapInfo.bmiHeader.biCompression =
-            BI_RGB;
-
-        bitmap_ =
-            CreateDIBSection(
-                dc_,
-                &bitmapInfo,
-                DIB_RGB_COLORS,
-                &bits_,
-                nullptr,
-                0);
+        bitmap_ = CreateDIBSection(
+            dc_,
+            &info,
+            DIB_RGB_COLORS,
+            &bits_,
+            nullptr,
+            0);
 
         if (!bitmap_) {
             return false;
         }
 
-        oldBitmap_ =
-            SelectObject(
-                dc_,
-                bitmap_);
+        oldBitmap_ = SelectObject(
+            dc_,
+            bitmap_);
 
         if (!oldBitmap_ ||
             oldBitmap_ == HGDI_ERROR) {
             return false;
         }
-
-        /*
-            COLORONCOLOR is fast and sufficient
-            for the low-latency capture path.
-        */
 
         SetStretchBltMode(
             dc_,
@@ -786,16 +668,11 @@ public:
         return true;
     }
 
-    bool CaptureFrame(
-        const RECT& source) {
-
+    bool CaptureFrame(const RECT& source) {
         const int sourceWidth =
-            source.right -
-            source.left;
-
+            source.right - source.left;
         const int sourceHeight =
-            source.bottom -
-            source.top;
+            source.bottom - source.top;
 
         if (sourceWidth <= 0 ||
             sourceHeight <= 0) {
@@ -810,26 +687,7 @@ public:
             static_cast<double>(fb_.w) /
             static_cast<double>(fb_.h);
 
-        RECT destination{
-            0,
-            0,
-            fb_.w,
-            fb_.h
-        };
-
-        /*
-            Keep the original monitor aspect ratio.
-
-            Example:
-
-                1920x1080 -> 480x320
-
-            actual image becomes:
-
-                480x270
-
-            with 25 px black bars top/bottom.
-        */
+        RECT destination{0, 0, fb_.w, fb_.h};
 
         if (sourceAspect > targetAspect) {
             destination.bottom =
@@ -839,10 +697,7 @@ public:
                     0.5);
 
             destination.top =
-                (fb_.h -
-                 destination.bottom) /
-                2;
-
+                (fb_.h - destination.bottom) / 2;
         } else {
             destination.right =
                 static_cast<LONG>(
@@ -851,9 +706,7 @@ public:
                     0.5);
 
             destination.left =
-                (fb_.w -
-                 destination.right) /
-                2;
+                (fb_.w - destination.right) / 2;
         }
 
         const RECT fullTarget{
@@ -863,43 +716,30 @@ public:
             fb_.h
         };
 
-        /*
-            Clear the complete output to black.
-
-            This provides the letterbox /
-            pillarbox area.
-        */
-
         FillRect(
             dc_,
             &fullTarget,
             static_cast<HBRUSH>(
-                GetStockObject(
-                    BLACK_BRUSH)));
+                GetStockObject(BLACK_BRUSH)));
 
         return StretchBlt(
                    dc_,
-
                    destination.left,
                    destination.top,
                    destination.right -
                        destination.left,
                    destination.bottom -
                        destination.top,
-
                    screen_,
-
                    source.left,
                    source.top,
                    sourceWidth,
                    sourceHeight,
-
                    SRCCOPY) != FALSE;
     }
 
     const BYTE* Pixels() const {
-        return static_cast<
-            const BYTE*>(bits_);
+        return static_cast<const BYTE*>(bits_);
     }
 
     int Width() const {
@@ -920,38 +760,6 @@ class Stream {
     HINTERNET connect_ = nullptr;
     HINTERNET request_ = nullptr;
 
-    bool WriteBytes(
-        const void* data,
-        size_t size) {
-
-        const BYTE* p =
-            static_cast<const BYTE*>(data);
-
-        while (size > 0) {
-            const size_t maxChunk =
-                std::numeric_limits<DWORD>::max();
-
-            const DWORD chunk =
-                static_cast<DWORD>(
-                    std::min(
-                        size,
-                        maxChunk));
-
-            if (!WinHttpWriteData(
-                    request_,
-                    p,
-                    chunk,
-                    nullptr)) {
-                return false;
-            }
-
-            p += chunk;
-            size -= chunk;
-        }
-
-        return true;
-    }
-
 public:
     ~Stream() {
         if (request_) {
@@ -967,82 +775,53 @@ public:
         }
     }
 
-    bool Open(
-        const std::wstring& baseUrl) {
-
+    bool Open(const std::wstring& baseUrl) {
         Url url;
 
         if (!Crack(baseUrl, url)) {
             return false;
         }
 
-        session_ =
-            WinHttpOpen(
-                L"displayPost/0.3",
-                WINHTTP_ACCESS_TYPE_NO_PROXY,
-                nullptr,
-                nullptr,
-                0);
+        session_ = WinHttpOpen(
+            L"displayPost/0.5",
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            nullptr,
+            nullptr,
+            0);
 
         if (!session_) {
             return false;
         }
 
-        /*
-            Use the server's actual host/port.
-        */
-
-        connect_ =
-            WinHttpConnect(
-                session_,
-                url.host.c_str(),
-                url.port,
-                0);
+        connect_ = WinHttpConnect(
+            session_,
+            url.host.c_str(),
+            url.port,
+            0);
 
         if (!connect_) {
             return false;
         }
 
-        /*
-            User gives the base URL.
-
-            Example:
-
-                http://192.168.2.195:8080
-
-            becomes:
-
-                POST /fb
-        */
-
         const std::wstring path =
-            JoinPath(
-                url.path,
-                L"/fb");
+            JoinPath(url.path, L"/fb");
 
-        request_ =
-            WinHttpOpenRequest(
-                connect_,
-                L"POST",
-                path.c_str(),
-                nullptr,
-                WINHTTP_NO_REFERER,
-                WINHTTP_DEFAULT_ACCEPT_TYPES,
-                url.tls
-                    ? WINHTTP_FLAG_SECURE
-                    : 0);
+        request_ = WinHttpOpenRequest(
+            connect_,
+            L"POST",
+            path.c_str(),
+            nullptr,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            url.tls
+                ? WINHTTP_FLAG_SECURE
+                : 0);
 
         if (!request_) {
             return false;
         }
 
-        /*
-            Force HTTP/1.1.
-
-            A zero protocol mask means:
-            don't enable HTTP/2 or HTTP/3.
-        */
-
+        // Disable HTTP/2 and HTTP/3 so this stays HTTP/1.1.
         DWORD enabledProtocols = 0;
 
         if (!WinHttpSetOption(
@@ -1054,33 +833,19 @@ public:
         }
 
         /*
-            This intentionally matches the
-            working ffmpeg/curl request:
+            Match the working curl command.
 
-                Content-Type:
-                multipart/x-mixed-replace;
-                boundary=ffmpeg
-
-            and disables Expect: 100-continue.
+            Important:
+            do NOT add Transfer-Encoding: chunked here.
+            With WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
+            WinHTTP handles HTTP/1.1 chunk framing itself.
         */
 
         LPCWSTR headers =
             L"Content-Type: "
             L"multipart/x-mixed-replace; "
             L"boundary=ffmpeg\r\n"
-            L"Transfer-Encoding: chunked\r\n"
             L"Expect:\r\n";
-
-        /*
-            The body is intentionally an
-            unknown-length HTTP/1.1 stream.
-
-            WinHTTP therefore uses chunked
-            transfer for the request body,
-            just like:
-
-                curl --http1.1 -T -
-        */
 
         return WinHttpSendRequest(
                    request_,
@@ -1100,70 +865,87 @@ public:
         }
 
         /*
-            ffmpeg mpjpeg style frame:
+            Multipart frame format:
 
                 --ffmpeg\r\n
-                Content-Type: image/jpeg\r\n
-                Content-Length: N\r\n
+                Content-type: image/jpeg\r\n
+                Content-length: N\r\n
+                \r\n
+                JPEG bytes
                 \r\n
 
-                [JPEG]
-
-                \r\n
+            HTTP chunk framing is intentionally NOT
+            added here. WinHTTP adds that transport
+            framing itself.
         */
 
         const std::string header =
             "--ffmpeg\r\n"
-            "Content-Type: image/jpeg\r\n"
-            "Content-Length: " +
+            "Content-type: image/jpeg\r\n"
+            "Content-length: " +
             std::to_string(jpeg.size()) +
             "\r\n"
             "\r\n";
 
-        if (!WriteBytes(
+        if (!WinHttpWriteData(
+                request_,
                 header.data(),
-                header.size())) {
+                static_cast<DWORD>(header.size()),
+                nullptr)) {
             return false;
         }
 
-        if (!WriteBytes(
+        if (jpeg.size() >
+            std::numeric_limits<DWORD>::max()) {
+            return false;
+        }
+
+        if (!WinHttpWriteData(
+                request_,
                 jpeg.data(),
-                jpeg.size())) {
+                static_cast<DWORD>(jpeg.size()),
+                nullptr)) {
             return false;
         }
 
-        static const char endOfFrame[] =
-            "\r\n";
+        static const char endOfFrame[] = "\r\n";
 
-        return WriteBytes(
-            endOfFrame,
-            sizeof(endOfFrame) - 1);
+        return WinHttpWriteData(
+                   request_,
+                   endOfFrame,
+                   sizeof(endOfFrame) - 1,
+                   nullptr) != FALSE;
     }
 
     bool Finish() {
         /*
-            End the multipart stream cleanly
-            for finite frame-count mode.
-
-            The server's multipart reader also
-            accepts ordinary EOF, so the normal
-            streaming path does not depend on
-            this marker.
+            For a finite stream, finish multipart first.
         */
 
         static const char endBoundary[] =
             "--ffmpeg--\r\n";
 
-        if (!WriteBytes(
+        if (!WinHttpWriteData(
+                request_,
                 endBoundary,
-                sizeof(endBoundary) - 1)) {
+                sizeof(endBoundary) - 1,
+                nullptr)) {
             return false;
         }
 
         /*
-            Finalize the HTTP request and wait
-            for the Go server response.
+            With WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
+            zero-length WriteData tells WinHTTP there
+            is no more request-body data.
         */
+
+        if (!WinHttpWriteData(
+                request_,
+                nullptr,
+                0,
+                nullptr)) {
+            return false;
+        }
 
         if (!WinHttpReceiveResponse(
                 request_,
@@ -1204,13 +986,9 @@ static uint64_t ParseUnsigned(
     wchar_t* end = nullptr;
 
     const uint64_t value =
-        _wcstoui64(
-            text,
-            &end,
-            10);
+        _wcstoui64(text, &end, 10);
 
-    if (!end ||
-        *end != L'\0') {
+    if (!end || *end != L'\0') {
         throw std::runtime_error(
             "invalid numeric argument");
     }
@@ -1224,18 +1002,10 @@ int wmain(
 
     if (argc < 2) {
         std::wcerr
-            << L"Usage: "
-            << L"displayPost.exe "
-            << L"<url> "
-            << L"[frames=0] "
-            << L"[monitor=1]\n";
-
+            << L"Usage: displayPost.exe "
+            << L"<url> [frames=0] [monitor=1]\n";
         return 2;
     }
-
-    /*
-        CreateStreamOnHGlobal is a COM API.
-    */
 
     const HRESULT comResult =
         CoInitializeEx(
@@ -1247,29 +1017,18 @@ int wmain(
 
     if (FAILED(comResult) &&
         comResult != RPC_E_CHANGED_MODE) {
-
         std::cerr
             << "error: CoInitializeEx failed\n";
-
         return 1;
     }
 
     try {
-        const std::wstring url =
-            argv[1];
-
-        /*
-            0 = continuous
-        */
+        const std::wstring url = argv[1];
 
         const uint64_t frames =
             argc > 2
                 ? ParseUnsigned(argv[2])
                 : 0;
-
-        /*
-            Monitor number is 1-based.
-        */
 
         const uint64_t monitorIndex =
             argc > 3
@@ -1281,18 +1040,7 @@ int wmain(
                 "monitor must be >= 1");
         }
 
-        /*
-            First obtain the actual X1830
-            framebuffer resolution.
-        */
-
-        const Fb fb =
-            ReadFbInfo(url);
-
-        /*
-            Then select the actual physical
-            Windows monitor.
-        */
+        const Fb fb = ReadFbInfo(url);
 
         const std::vector<MonitorInfo> monitors =
             EnumerateMonitors();
@@ -1302,8 +1050,7 @@ int wmain(
                 "no Windows monitors found");
         }
 
-        if (monitorIndex >
-            monitors.size()) {
+        if (monitorIndex > monitors.size()) {
             throw std::runtime_error(
                 "monitor out of range");
         }
@@ -1316,7 +1063,6 @@ int wmain(
         }
 
         JpegEncoder encoder;
-
         Stream stream;
 
         if (!stream.Open(url)) {
@@ -1326,15 +1072,9 @@ int wmain(
 
         std::vector<BYTE> jpeg;
 
-        /*
-            30 FPS.
-        */
-
         constexpr int FPS = 30;
-
         constexpr auto FRAME_INTERVAL =
-            std::chrono::microseconds(
-                1000000 / FPS);
+            std::chrono::microseconds(1000000 / FPS);
 
         auto nextFrame =
             std::chrono::steady_clock::now();
@@ -1343,30 +1083,14 @@ int wmain(
 
         const RECT monitorRect =
             monitors[
-                static_cast<size_t>(
-                    monitorIndex - 1)
+                static_cast<size_t>(monitorIndex - 1)
             ].rect;
 
-        while (
-            !frames ||
-            sentFrames < frames) {
-
-            /*
-                1. Capture the physical display
-                2. Scale proportionally
-                3. Add black bars
-            */
-
-            if (!capture.CaptureFrame(
-                    monitorRect)) {
+        while (!frames || sentFrames < frames) {
+            if (!capture.CaptureFrame(monitorRect)) {
                 throw std::runtime_error(
                     "capture frame failed");
             }
-
-            /*
-                Encode the final target-size
-                image as JPEG.
-            */
 
             if (!encoder.Encode(
                     capture.Pixels(),
@@ -1378,41 +1102,17 @@ int wmain(
                     "JPEG encode failed");
             }
 
-            /*
-                Send one multipart JPEG part.
-            */
-
             if (!stream.WriteFrame(jpeg)) {
                 throw std::runtime_error(
-                    "MJPEG stream write failed");
+                    "MJPEG stream write failed at frame " +
+                    std::to_string(sentFrames + 1));
             }
 
             ++sentFrames;
 
-            /*
-                Pacing is based on a fixed timeline,
-                rather than sleeping a full frame
-                interval after the work finishes.
-            */
-
-            nextFrame +=
-                FRAME_INTERVAL;
-
-            std::this_thread::sleep_until(
-                nextFrame);
+            nextFrame += FRAME_INTERVAL;
+            std::this_thread::sleep_until(nextFrame);
         }
-
-        /*
-            Finite mode:
-
-                frames > 0
-
-            Cleanly close the multipart stream
-            and wait for the HTTP response.
-
-            Continuous mode intentionally never
-            reaches here until the process exits.
-        */
 
         if (frames != 0) {
             if (!stream.Finish()) {
