@@ -92,6 +92,17 @@ static bool Crack(const std::wstring& input, Url& out) {
     return true;
 }
 
+static std::wstring NormalizeUrl(std::wstring url) {
+    if (url.size() < 7 ||
+        (_wcsnicmp(url.c_str(), L"http://", 7) != 0 &&
+         (url.size() < 8 ||
+          _wcsnicmp(url.c_str(), L"https://", 8) != 0))) {
+        url = L"http://" + url;
+    }
+
+    return url;
+}
+
 static std::wstring JoinPath(
     const std::wstring& base,
     const std::wstring& relative) {
@@ -1365,11 +1376,49 @@ int wmain(
     int argc,
     wchar_t** argv) {
 
+    if (!SetProcessDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+        SetProcessDPIAware();
+    }
+
     if (argc < 2) {
-        std::wcerr
-            << L"Usage: displayPost.exe "
-            << L"<url> [fps=30] [monitor=1] [rotation=0]\n";
-        return 2;
+        std::wstring input;
+
+        std::wcout << L"workdayAlarmClockGo URL: ";
+        std::getline(std::wcin, input);
+        if (input.empty()) {
+            std::wcerr << L"URL is empty\n";
+            return 2;
+        }
+
+        std::wstring fpsInput;
+        std::wstring monitorInput;
+        std::wstring rotationInput;
+
+        std::wcout << L"fps (default 30): ";
+        std::getline(std::wcin, fpsInput);
+        std::wcout << L"monitor (default 1): ";
+        std::getline(std::wcin, monitorInput);
+        std::wcout << L"rotation (0/90/180/270 default 0): ";
+        std::getline(std::wcin, rotationInput);
+
+        const std::wstring normalizedUrl = NormalizeUrl(input);
+        const std::wstring fps = fpsInput.empty() ? L"30" : fpsInput;
+        const std::wstring monitor =
+            monitorInput.empty() ? L"1" : monitorInput;
+        const std::wstring rotation =
+            rotationInput.empty() ? L"0" : rotationInput;
+
+        std::vector<wchar_t*> interactiveArgs{
+            argv[0],
+            const_cast<wchar_t*>(normalizedUrl.c_str()),
+            const_cast<wchar_t*>(fps.c_str()),
+            const_cast<wchar_t*>(monitor.c_str()),
+            const_cast<wchar_t*>(rotation.c_str())};
+
+        return wmain(
+            static_cast<int>(interactiveArgs.size()),
+            interactiveArgs.data());
     }
 
     const HRESULT comResult =
@@ -1388,7 +1437,7 @@ int wmain(
     }
 
     try {
-        const std::wstring url = argv[1];
+        const std::wstring url = NormalizeUrl(argv[1]);
 
         const uint64_t fps =
             argc > 2

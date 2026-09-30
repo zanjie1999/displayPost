@@ -3,6 +3,8 @@
 可以将任意显示器画面同步到任意Linux设备上，比如 Buildroot的智能音箱，Kindle，KVM或路由器上的小屏幕
 
 ## 如何使用
+直接双击运行也行
+
 ```cmd
 displayPost.exe <url> [fps=30] [monitor=1] [rotation=0]
 ```
