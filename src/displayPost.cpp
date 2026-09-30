@@ -760,6 +760,78 @@ class Stream {
     HINTERNET connect_ = nullptr;
     HINTERNET request_ = nullptr;
 
+    bool WriteRaw(const void* data, size_t size) {
+        const BYTE* p = static_cast<const BYTE*>(data);
+
+        while (size > 0) {
+            const DWORD chunk = static_cast<DWORD>(
+                std::min<size_t>(
+                    size,
+                    std::numeric_limits<DWORD>::max()));
+
+            if (!WinHttpWriteData(
+                    request_,
+                    p,
+                    chunk,
+                    nullptr)) {
+                return false;
+            }
+
+            p += chunk;
+            size -= chunk;
+        }
+
+        return true;
+    }
+
+    /*
+        Write one HTTP/1.1 chunk.
+
+        The wire format is:
+
+            HEX_LENGTH\r\n
+            DATA\r\n
+        WinHTTP accepts these bytes through WinHttpWriteData.
+    */
+    bool WriteChunk(const void* data, size_t size) {
+        char length[32]{};
+
+        const int lengthChars = std::snprintf(
+            length,
+            sizeof(length),
+            "%zX\r\n",
+            size);
+
+        if (lengthChars <= 0 ||
+            static_cast<size_t>(lengthChars) >= sizeof(length)) {
+            return false;
+        }
+
+        if (!WriteRaw(
+                length,
+                static_cast<size_t>(lengthChars))) {
+            return false;
+        }
+
+        if (size > 0 && !WriteRaw(data, size)) {
+            return false;
+        }
+
+        static const char crlf[] = "\r\n";
+
+        return WriteRaw(
+            crlf,
+            sizeof(crlf) - 1);
+    }
+
+    bool WriteChunkedEnd() {
+        static const char end[] = "0\r\n\r\n";
+
+        return WriteRaw(
+            end,
+            sizeof(end) - 1);
+    }
+
 public:
     ~Stream() {
         if (request_) {
@@ -783,7 +855,7 @@ public:
         }
 
         session_ = WinHttpOpen(
-            L"displayPost/0.5",
+            L"displayPost/0.6",
             WINHTTP_ACCESS_TYPE_NO_PROXY,
             nullptr,
             nullptr,
@@ -803,8 +875,9 @@ public:
             return false;
         }
 
-        const std::wstring path =
-            JoinPath(url.path, L"/fb");
+        const std::wstring path = JoinPath(
+            url.path,
+            L"/fb");
 
         request_ = WinHttpOpenRequest(
             connect_,
@@ -821,65 +894,67 @@ public:
             return false;
         }
 
-        // Disable HTTP/2 and HTTP/3 so this stays HTTP/1.1.
-        DWORD enabledProtocols = 0;
+        /*
+            This is the same HTTP streaming mechanism used by
+            curl -T - for an unknown-length request body.
 
-        if (!WinHttpSetOption(
+            WinHTTP must see Transfer-Encoding before SendRequest.
+        */
+        static const wchar_t transferEncoding[] =
+            L"Transfer-Encoding: chunked\r\n";
+
+        if (!WinHttpAddRequestHeaders(
                 request_,
-                WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
-                &enabledProtocols,
-                sizeof(enabledProtocols))) {
+                transferEncoding,
+                static_cast<DWORD>(-1),
+                WINHTTP_ADDREQ_FLAG_ADD)) {
+            return false;
+        }
+
+        static const wchar_t contentType[] =
+            L"Content-Type: multipart/x-mixed-replace; "
+            L"boundary=ffmpeg\r\n"
+            L"Expect:\r\n";
+
+        if (!WinHttpAddRequestHeaders(
+                request_,
+                contentType,
+                static_cast<DWORD>(-1),
+                WINHTTP_ADDREQ_FLAG_ADD)) {
             return false;
         }
 
         /*
-            Match the working curl command.
-
-            Important:
-            do NOT add Transfer-Encoding: chunked here.
-            With WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
-            WinHTTP handles HTTP/1.1 chunk framing itself.
+            Unknown total length because the stream is continuous.
+            The actual HTTP chunks are written by WriteChunk().
         */
-
-        LPCWSTR headers =
-            L"Content-Type: "
-            L"multipart/x-mixed-replace; "
-            L"boundary=ffmpeg\r\n"
-            L"Expect:\r\n";
-
         return WinHttpSendRequest(
                    request_,
-                   headers,
-                   static_cast<DWORD>(-1),
-                   nullptr,
+                   WINHTTP_NO_ADDITIONAL_HEADERS,
+                   0,
+                   WINHTTP_NO_REQUEST_DATA,
                    0,
                    WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
                    0) != FALSE;
     }
 
-    bool WriteFrame(
-        const std::vector<BYTE>& jpeg) {
-
+    bool WriteFrame(const std::vector<BYTE>& jpeg) {
         if (jpeg.empty()) {
             return false;
         }
 
         /*
-            Multipart frame format:
+            Multipart MJPEG frame.  After HTTP chunk decoding,
+            Go's multipart.Reader sees exactly this:
 
                 --ffmpeg\r\n
                 Content-type: image/jpeg\r\n
                 Content-length: N\r\n
                 \r\n
-                JPEG bytes
+                JPEG
                 \r\n
-
-            HTTP chunk framing is intentionally NOT
-            added here. WinHTTP adds that transport
-            framing itself.
         */
-
-        const std::string header =
+        const std::string partHeader =
             "--ffmpeg\r\n"
             "Content-type: image/jpeg\r\n"
             "Content-length: " +
@@ -887,63 +962,53 @@ public:
             "\r\n"
             "\r\n";
 
-        if (!WinHttpWriteData(
-                request_,
-                header.data(),
-                static_cast<DWORD>(header.size()),
-                nullptr)) {
-            return false;
-        }
+        const size_t totalSize =
+            partHeader.size() +
+            jpeg.size() +
+            2;
 
-        if (jpeg.size() >
-            std::numeric_limits<DWORD>::max()) {
-            return false;
-        }
+        std::vector<BYTE> part(totalSize);
+        BYTE* p = part.data();
 
-        if (!WinHttpWriteData(
-                request_,
-                jpeg.data(),
-                static_cast<DWORD>(jpeg.size()),
-                nullptr)) {
-            return false;
-        }
+        std::memcpy(
+            p,
+            partHeader.data(),
+            partHeader.size());
 
-        static const char endOfFrame[] = "\r\n";
+        p += partHeader.size();
 
-        return WinHttpWriteData(
-                   request_,
-                   endOfFrame,
-                   sizeof(endOfFrame) - 1,
-                   nullptr) != FALSE;
+        std::memcpy(
+            p,
+            jpeg.data(),
+            jpeg.size());
+
+        p += jpeg.size();
+
+        p[0] = '\r';
+        p[1] = '\n';
+
+        return WriteChunk(
+            part.data(),
+            part.size());
     }
 
     bool Finish() {
         /*
-            For a finite stream, finish multipart first.
+            Complete the multipart stream first.
         */
-
         static const char endBoundary[] =
             "--ffmpeg--\r\n";
 
-        if (!WinHttpWriteData(
-                request_,
+        if (!WriteChunk(
                 endBoundary,
-                sizeof(endBoundary) - 1,
-                nullptr)) {
+                sizeof(endBoundary) - 1)) {
             return false;
         }
 
         /*
-            With WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
-            zero-length WriteData tells WinHTTP there
-            is no more request-body data.
+            Then terminate HTTP chunked transfer.
         */
-
-        if (!WinHttpWriteData(
-                request_,
-                nullptr,
-                0,
-                nullptr)) {
+        if (!WriteChunkedEnd()) {
             return false;
         }
 
