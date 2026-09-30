@@ -588,6 +588,7 @@ public:
 
 class Capture {
     Fb fb_;
+    int rotation_ = 0;
 
     HDC screen_ = nullptr;
     HDC dc_ = nullptr;
@@ -616,8 +617,9 @@ public:
         }
     }
 
-    bool Init(const Fb& fb) {
+    bool Init(const Fb& fb, int rotation) {
         fb_ = fb;
+        rotation_ = rotation;
 
         screen_ = GetDC(nullptr);
         if (!screen_) {
@@ -679,9 +681,33 @@ public:
             return false;
         }
 
+        /*
+            Calculate the aspect ratio after rotation.
+
+            0 / 180 degrees:
+                width  = sourceWidth
+                height = sourceHeight
+
+            90 / 270 degrees:
+                width  = sourceHeight
+                height = sourceWidth
+        */
+        const bool quarterTurn =
+            rotation_ == 90 || rotation_ == 270;
+
+        const int rotatedWidth =
+            quarterTurn
+                ? sourceHeight
+                : sourceWidth;
+
+        const int rotatedHeight =
+            quarterTurn
+                ? sourceWidth
+                : sourceHeight;
+
         const double sourceAspect =
-            static_cast<double>(sourceWidth) /
-            static_cast<double>(sourceHeight);
+            static_cast<double>(rotatedWidth) /
+            static_cast<double>(rotatedHeight);
 
         const double targetAspect =
             static_cast<double>(fb_.w) /
@@ -716,26 +742,93 @@ public:
             fb_.h
         };
 
+        /*
+            Clear the whole target first so that
+            letterbox/pillarbox areas are black.
+        */
         FillRect(
             dc_,
             &fullTarget,
             static_cast<HBRUSH>(
                 GetStockObject(BLACK_BRUSH)));
 
-        return StretchBlt(
+        const LONG left = destination.left;
+        const LONG top = destination.top;
+        const LONG right = destination.right;
+        const LONG bottom = destination.bottom;
+
+        const int width = right - left;
+        const int height = bottom - top;
+
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+
+        if (rotation_ == 0) {
+            return StretchBlt(
+                       dc_,
+                       left,
+                       top,
+                       width,
+                       height,
+                       screen_,
+                       source.left,
+                       source.top,
+                       sourceWidth,
+                       sourceHeight,
+                       SRCCOPY) != FALSE;
+        }
+
+        /*
+            PlgBlt maps the source rectangle to the
+            destination parallelogram defined by:
+
+                points[0] = source top-left
+                points[1] = source top-right
+                points[2] = source bottom-left
+
+            For a 90 degree clockwise rotation:
+
+                source TL -> destination TR
+                source TR -> destination BR
+                source BL -> destination TL
+        */
+        POINT points[3]{};
+
+        switch (rotation_) {
+        case 90:
+            points[0] = {right, top};
+            points[1] = {right, bottom};
+            points[2] = {left, top};
+            break;
+
+        case 180:
+            points[0] = {right, bottom};
+            points[1] = {left, bottom};
+            points[2] = {right, top};
+            break;
+
+        case 270:
+            points[0] = {left, bottom};
+            points[1] = {left, top};
+            points[2] = {right, bottom};
+            break;
+
+        default:
+            return false;
+        }
+
+        return PlgBlt(
                    dc_,
-                   destination.left,
-                   destination.top,
-                   destination.right -
-                       destination.left,
-                   destination.bottom -
-                       destination.top,
+                   points,
                    screen_,
                    source.left,
                    source.top,
                    sourceWidth,
                    sourceHeight,
-                   SRCCOPY) != FALSE;
+                   nullptr,
+                   0,
+                   0) != FALSE;
     }
 
     const BYTE* Pixels() const {
@@ -1100,6 +1193,11 @@ int wmain(
                 ? ParseUnsigned(argv[3])
                 : 1;
 
+        const uint64_t rotation =
+            argc > 4
+                ? ParseUnsigned(argv[4])
+                : 0;
+
         if (monitorIndex == 0) {
             throw std::runtime_error(
                 "monitor must be >= 1");
@@ -1120,9 +1218,17 @@ int wmain(
                 "monitor out of range");
         }
 
+        if (rotation != 0 &&
+            rotation != 90 &&
+            rotation != 180 &&
+            rotation != 270) {
+            throw std::runtime_error(
+                "rotation must be 0, 90, 180, or 270 degrees");
+        }
+
         Capture capture;
 
-        if (!capture.Init(fb)) {
+        if (!capture.Init(fb, static_cast<int>(rotation))) {
             throw std::runtime_error(
                 "capture initialization failed");
         }
