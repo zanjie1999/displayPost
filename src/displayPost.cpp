@@ -592,11 +592,176 @@ class Capture {
 
     HDC screen_ = nullptr;
     HDC dc_ = nullptr;
+    HDC scratchDc_ = nullptr;
 
     HBITMAP bitmap_ = nullptr;
+    HBITMAP scratchBitmap_ = nullptr;
+
     void* bits_ = nullptr;
+    void* scratchBits_ = nullptr;
 
     HGDIOBJ oldBitmap_ = nullptr;
+    HGDIOBJ oldScratchBitmap_ = nullptr;
+
+    int scratchWidth_ = 0;
+    int scratchHeight_ = 0;
+
+    bool CreateDib(
+        HDC dc,
+        int width,
+        int height,
+        HBITMAP& bitmap,
+        void*& bits,
+        HGDIOBJ& oldBitmap) {
+
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+
+        bitmap = CreateDIBSection(
+            dc,
+            &info,
+            DIB_RGB_COLORS,
+            &bits,
+            nullptr,
+            0);
+
+        if (!bitmap) {
+            return false;
+        }
+
+        oldBitmap = SelectObject(dc, bitmap);
+        if (!oldBitmap || oldBitmap == HGDI_ERROR) {
+            DeleteObject(bitmap);
+            bitmap = nullptr;
+            bits = nullptr;
+            return false;
+        }
+
+        SetStretchBltMode(dc, COLORONCOLOR);
+        return true;
+    }
+
+    static void Rotate90CW(
+        const BYTE* src,
+        int srcWidth,
+        int srcHeight,
+        int srcStride,
+        BYTE* dst,
+        int dstWidth,
+        int dstHeight,
+        int dstStride,
+        int dstLeft,
+        int dstTop) {
+
+        (void)dstWidth;
+        (void)dstHeight;
+
+        for (int y = 0; y < srcHeight; ++y) {
+            const BYTE* srcRow =
+                src + static_cast<size_t>(y) * srcStride;
+
+            for (int x = 0; x < srcWidth; ++x) {
+                const BYTE* pixel = srcRow + x * 4;
+
+                const int dx =
+                    dstLeft + (srcHeight - 1 - y);
+                const int dy =
+                    dstTop + x;
+
+                BYTE* out =
+                    dst + static_cast<size_t>(dy) * dstStride +
+                    static_cast<size_t>(dx) * 4;
+
+                out[0] = pixel[0];
+                out[1] = pixel[1];
+                out[2] = pixel[2];
+                out[3] = pixel[3];
+            }
+        }
+    }
+
+    static void Rotate90CCW(
+        const BYTE* src,
+        int srcWidth,
+        int srcHeight,
+        int srcStride,
+        BYTE* dst,
+        int dstWidth,
+        int dstHeight,
+        int dstStride,
+        int dstLeft,
+        int dstTop) {
+
+        (void)dstWidth;
+        (void)dstHeight;
+
+        for (int y = 0; y < srcHeight; ++y) {
+            const BYTE* srcRow =
+                src + static_cast<size_t>(y) * srcStride;
+
+            for (int x = 0; x < srcWidth; ++x) {
+                const BYTE* pixel = srcRow + x * 4;
+
+                const int dx =
+                    dstLeft + y;
+                const int dy =
+                    dstTop + (srcWidth - 1 - x);
+
+                BYTE* out =
+                    dst + static_cast<size_t>(dy) * dstStride +
+                    static_cast<size_t>(dx) * 4;
+
+                out[0] = pixel[0];
+                out[1] = pixel[1];
+                out[2] = pixel[2];
+                out[3] = pixel[3];
+            }
+        }
+    }
+
+    static void Rotate180(
+        const BYTE* src,
+        int srcWidth,
+        int srcHeight,
+        int srcStride,
+        BYTE* dst,
+        int dstWidth,
+        int dstHeight,
+        int dstStride,
+        int dstLeft,
+        int dstTop) {
+
+        (void)dstWidth;
+        (void)dstHeight;
+
+        for (int y = 0; y < srcHeight; ++y) {
+            const BYTE* srcRow =
+                src + static_cast<size_t>(y) * srcStride;
+
+            for (int x = 0; x < srcWidth; ++x) {
+                const BYTE* pixel = srcRow + x * 4;
+
+                const int dx =
+                    dstLeft + (srcWidth - 1 - x);
+                const int dy =
+                    dstTop + (srcHeight - 1 - y);
+
+                BYTE* out =
+                    dst + static_cast<size_t>(dy) * dstStride +
+                    static_cast<size_t>(dx) * 4;
+
+                out[0] = pixel[0];
+                out[1] = pixel[1];
+                out[2] = pixel[2];
+                out[3] = pixel[3];
+            }
+        }
+    }
 
 public:
     ~Capture() {
@@ -604,12 +769,24 @@ public:
             SelectObject(dc_, oldBitmap_);
         }
 
+        if (scratchDc_ && oldScratchBitmap_) {
+            SelectObject(scratchDc_, oldScratchBitmap_);
+        }
+
         if (bitmap_) {
             DeleteObject(bitmap_);
         }
 
+        if (scratchBitmap_) {
+            DeleteObject(scratchBitmap_);
+        }
+
         if (dc_) {
             DeleteDC(dc_);
+        }
+
+        if (scratchDc_) {
+            DeleteDC(scratchDc_);
         }
 
         if (screen_) {
@@ -631,41 +808,39 @@ public:
             return false;
         }
 
-        BITMAPINFO info{};
-        info.bmiHeader.biSize =
-            sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth =
-            fb.w;
-        info.bmiHeader.biHeight =
-            -fb.h; // top-down DIB
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-
-        bitmap_ = CreateDIBSection(
-            dc_,
-            &info,
-            DIB_RGB_COLORS,
-            &bits_,
-            nullptr,
-            0);
-
-        if (!bitmap_) {
+        if (!CreateDib(
+                dc_,
+                fb.w,
+                fb.h,
+                bitmap_,
+                bits_,
+                oldBitmap_)) {
             return false;
         }
 
-        oldBitmap_ = SelectObject(
-            dc_,
-            bitmap_);
-
-        if (!oldBitmap_ ||
-            oldBitmap_ == HGDI_ERROR) {
+        scratchDc_ = CreateCompatibleDC(screen_);
+        if (!scratchDc_) {
             return false;
         }
 
-        SetStretchBltMode(
-            dc_,
-            COLORONCOLOR);
+        /*
+            90/270 degrees need a temporary image whose
+            dimensions are swapped. A square scratch bitmap
+            of max(width,height) is enough because the scaled
+            pre-rotation image always fits inside the target.
+        */
+        scratchWidth_ = std::max(fb.w, fb.h);
+        scratchHeight_ = std::max(fb.w, fb.h);
+
+        if (!CreateDib(
+                scratchDc_,
+                scratchWidth_,
+                scratchHeight_,
+                scratchBitmap_,
+                scratchBits_,
+                oldScratchBitmap_)) {
+            return false;
+        }
 
         return true;
     }
@@ -676,64 +851,52 @@ public:
         const int sourceHeight =
             source.bottom - source.top;
 
-        if (sourceWidth <= 0 ||
-            sourceHeight <= 0) {
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
             return false;
         }
 
-        /*
-            Calculate the aspect ratio after rotation.
-
-            0 / 180 degrees:
-                width  = sourceWidth
-                height = sourceHeight
-
-            90 / 270 degrees:
-                width  = sourceHeight
-                height = sourceWidth
-        */
         const bool quarterTurn =
             rotation_ == 90 || rotation_ == 270;
 
-        const int rotatedWidth =
-            quarterTurn
-                ? sourceHeight
-                : sourceWidth;
-
-        const int rotatedHeight =
-            quarterTurn
-                ? sourceWidth
-                : sourceHeight;
+        /*
+            Work out the aspect ratio of the image AFTER
+            rotation. This determines the letterbox size.
+        */
+        const int rotatedSourceWidth =
+            quarterTurn ? sourceHeight : sourceWidth;
+        const int rotatedSourceHeight =
+            quarterTurn ? sourceWidth : sourceHeight;
 
         const double sourceAspect =
-            static_cast<double>(rotatedWidth) /
-            static_cast<double>(rotatedHeight);
+            static_cast<double>(rotatedSourceWidth) /
+            static_cast<double>(rotatedSourceHeight);
 
         const double targetAspect =
             static_cast<double>(fb_.w) /
             static_cast<double>(fb_.h);
 
-        RECT destination{0, 0, fb_.w, fb_.h};
+        int contentWidth = fb_.w;
+        int contentHeight = fb_.h;
 
         if (sourceAspect > targetAspect) {
-            destination.bottom =
-                static_cast<LONG>(
-                    static_cast<double>(fb_.w) /
-                    sourceAspect +
-                    0.5);
-
-            destination.top =
-                (fb_.h - destination.bottom) / 2;
+            contentHeight = static_cast<int>(
+                static_cast<double>(fb_.w) /
+                sourceAspect +
+                0.5);
         } else {
-            destination.right =
-                static_cast<LONG>(
-                    static_cast<double>(fb_.h) *
-                    sourceAspect +
-                    0.5);
-
-            destination.left =
-                (fb_.w - destination.right) / 2;
+            contentWidth = static_cast<int>(
+                static_cast<double>(fb_.h) *
+                sourceAspect +
+                0.5);
         }
+
+        contentWidth = std::max(1, contentWidth);
+        contentHeight = std::max(1, contentHeight);
+
+        const int left =
+            (fb_.w - contentWidth) / 2;
+        const int top =
+            (fb_.h - contentHeight) / 2;
 
         const RECT fullTarget{
             0,
@@ -742,35 +905,19 @@ public:
             fb_.h
         };
 
-        /*
-            Clear the whole target first so that
-            letterbox/pillarbox areas are black.
-        */
         FillRect(
             dc_,
             &fullTarget,
             static_cast<HBRUSH>(
                 GetStockObject(BLACK_BRUSH)));
 
-        const LONG left = destination.left;
-        const LONG top = destination.top;
-        const LONG right = destination.right;
-        const LONG bottom = destination.bottom;
-
-        const int width = right - left;
-        const int height = bottom - top;
-
-        if (width <= 0 || height <= 0) {
-            return false;
-        }
-
         if (rotation_ == 0) {
             return StretchBlt(
                        dc_,
                        left,
                        top,
-                       width,
-                       height,
+                       contentWidth,
+                       contentHeight,
                        screen_,
                        source.left,
                        source.top,
@@ -780,55 +927,115 @@ public:
         }
 
         /*
-            PlgBlt maps the source rectangle to the
-            destination parallelogram defined by:
+            Before rotation, the scaled image has swapped
+            dimensions for 90/270 degrees.
 
-                points[0] = source top-left
-                points[1] = source top-right
-                points[2] = source bottom-left
-
-            For a 90 degree clockwise rotation:
-
-                source TL -> destination TR
-                source TR -> destination BR
-                source BL -> destination TL
+                final content: contentWidth x contentHeight
+                pre-rotate:     contentHeight x contentWidth
         */
-        POINT points[3]{};
+        const int preWidth =
+            quarterTurn
+                ? contentHeight
+                : contentWidth;
+
+        const int preHeight =
+            quarterTurn
+                ? contentWidth
+                : contentHeight;
+
+        if (preWidth <= 0 ||
+            preHeight <= 0 ||
+            preWidth > scratchWidth_ ||
+            preHeight > scratchHeight_) {
+            return false;
+        }
+
+        const RECT scratchRect{
+            0,
+            0,
+            preWidth,
+            preHeight
+        };
+
+        FillRect(
+            scratchDc_,
+            &scratchRect,
+            static_cast<HBRUSH>(
+                GetStockObject(BLACK_BRUSH)));
+
+        if (!StretchBlt(
+                scratchDc_,
+                0,
+                0,
+                preWidth,
+                preHeight,
+                screen_,
+                source.left,
+                source.top,
+                sourceWidth,
+                sourceHeight,
+                SRCCOPY)) {
+            return false;
+        }
+
+        const BYTE* src =
+            static_cast<const BYTE*>(scratchBits_);
+
+        BYTE* dst =
+            static_cast<BYTE*>(bits_);
+
+        const int srcStride =
+            scratchWidth_ * 4;
+
+        const int dstStride =
+            fb_.w * 4;
 
         switch (rotation_) {
         case 90:
-            points[0] = {right, top};
-            points[1] = {right, bottom};
-            points[2] = {left, top};
-            break;
+            Rotate90CW(
+                src,
+                preWidth,
+                preHeight,
+                srcStride,
+                dst,
+                fb_.w,
+                fb_.h,
+                dstStride,
+                left,
+                top);
+            return true;
 
         case 180:
-            points[0] = {right, bottom};
-            points[1] = {left, bottom};
-            points[2] = {right, top};
-            break;
+            Rotate180(
+                src,
+                preWidth,
+                preHeight,
+                srcStride,
+                dst,
+                fb_.w,
+                fb_.h,
+                dstStride,
+                left,
+                top);
+            return true;
 
         case 270:
-            points[0] = {left, bottom};
-            points[1] = {left, top};
-            points[2] = {right, bottom};
-            break;
+            Rotate90CCW(
+                src,
+                preWidth,
+                preHeight,
+                srcStride,
+                dst,
+                fb_.w,
+                fb_.h,
+                dstStride,
+                left,
+                top);
+            return true;
 
         default:
             return false;
         }
-
-        return PlgBlt(
-                   dc_,
-                   points,
-                   screen_,
-                   source.left,
-                   source.top,
-                   sourceWidth,
-                   sourceHeight,
-                   nullptr,
-                   0,
-                   0) != FALSE;
     }
 
     const BYTE* Pixels() const {
@@ -1161,7 +1368,7 @@ int wmain(
     if (argc < 2) {
         std::wcerr
             << L"Usage: displayPost.exe "
-            << L"<url> [frames=0] [monitor=1]\n";
+            << L"<url> [fps=30] [monitor=1] [rotation=0]\n";
         return 2;
     }
 
@@ -1183,20 +1390,26 @@ int wmain(
     try {
         const std::wstring url = argv[1];
 
-        const uint64_t frames =
+        const uint64_t fps =
             argc > 2
                 ? ParseUnsigned(argv[2])
-                : 0;
+                : 30;
 
         const uint64_t monitorIndex =
             argc > 3
                 ? ParseUnsigned(argv[3])
                 : 1;
 
+        // Rotation angle, clockwise: 0, 90, 180, or 270 degrees.
         const uint64_t rotation =
             argc > 4
                 ? ParseUnsigned(argv[4])
                 : 0;
+
+        if (fps == 0 || fps > 1000) {
+            throw std::runtime_error(
+                "fps must be between 1 and 1000");
+        }
 
         if (monitorIndex == 0) {
             throw std::runtime_error(
@@ -1243,9 +1456,9 @@ int wmain(
 
         std::vector<BYTE> jpeg;
 
-        constexpr int FPS = 30;
-        constexpr auto FRAME_INTERVAL =
-            std::chrono::microseconds(1000000 / FPS);
+        const auto frameInterval =
+            std::chrono::microseconds(
+                static_cast<long long>(1000000 / fps));
 
         auto nextFrame =
             std::chrono::steady_clock::now();
@@ -1257,7 +1470,7 @@ int wmain(
                 static_cast<size_t>(monitorIndex - 1)
             ].rect;
 
-        while (!frames || sentFrames < frames) {
+        for (;;) {
             if (!capture.CaptureFrame(monitorRect)) {
                 throw std::runtime_error(
                     "capture frame failed");
@@ -1281,15 +1494,8 @@ int wmain(
 
             ++sentFrames;
 
-            nextFrame += FRAME_INTERVAL;
+            nextFrame += frameInterval;
             std::this_thread::sleep_until(nextFrame);
-        }
-
-        if (frames != 0) {
-            if (!stream.Finish()) {
-                throw std::runtime_error(
-                    "failed to finish /fb stream");
-            }
         }
 
         if (comInitialized) {
