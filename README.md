@@ -1,69 +1,47 @@
 # displayPost
 
-Windows x64 proof of concept for the X1830 framebuffer display project.
+Windows x64 low-latency framebuffer streamer for the X1830 project.
 
-## What it does
+## Usage
 
-1. Prompts for the X1830 HTTP base URL.
-2. GETs `/fbinfo`.
-3. Installs/loads the bundled Microsoft IddSample-based virtual display driver.
-4. Creates the software device with `SwDeviceCreate`.
-5. Waits for the virtual monitor to appear at the framebuffer resolution.
-6. Captures that monitor with GDI, converts 32-bit desktop pixels to RGB565, and continuously POSTs raw fixed-size frames to `/fb`.
+```text
+displayPost.exe <url> [frames=0] [monitor=1]
+```
 
-The application deliberately has no WebSocket/framing protocol. `/fb` is a continuous byte stream; each frame is exactly `frame_size` bytes reported by `/fbinfo`.
+- `url`: X1830 HTTP base URL, for example `http://192.168.1.154`
+- `frames`: number of frames to send; `0` means continuous
+- `monitor`: 1-based Windows display number; default is `1`
+- capture rate: **30 FPS**
 
-## Current PoC limits
+Example:
 
-- Windows client is x64.
-- X1830 framebuffer must report RGB565.
-- The bundled sample driver advertises 800x480 as its preferred mode (plus a few fallback modes). The first target is the common 800x480 X1830 panel.
-- GDI capture + CPU RGB565 conversion is intentionally simple; it is not the final high-performance path.
-- The Microsoft sample driver is built by GitHub Actions. Driver signing/install policy still applies on the target Windows machine. An unsigned/test-signed driver may require Windows test-signing mode for development.
+```text
+displayPost.exe http://192.168.1.154 300 1
+```
+
+The client first requests `/fbinfo`, then enumerates the real Windows monitors. It captures the selected monitor directly with GDI, scales it proportionally to the `/fbinfo` resolution with black letterboxing/pillarboxing, converts to the framebuffer's declared 16/32-bit bitfield format, and sends fixed-size raw frames continuously to `/fb`.
+
+For the supplied X1830 framebuffer:
+
+```text
+480x320
+xrgb8888
+stride=1920
+frame_size=614400
+height_virtual=640
+memory_size=1228800
+```
+
+only the visible 480x320 buffer is sent: `1920 * 320 = 614400` bytes per frame. The virtual/back buffer is not transmitted.
+
+## Low-latency design
+
+There is no WebSocket, multipart JPEG, ffmpeg process, JPEG encoding, or per-frame HTTP request. One HTTP/1.1 POST is opened and raw fixed-size frames are written into that stream. `Expect:` is disabled and WinHTTP is configured to bypass the system proxy.
+
+The first implementation uses a reusable 32-bit DIB and `StretchBlt`; when the target is XRGB8888 with a matching stride, the final copy is a direct row copy. RGB565 and other common 16/32-bit bitfields are converted directly into the output buffer.
 
 ## Build
 
-Push to `main` or run the `Build displayPost` workflow manually. The workflow uses the current Microsoft Windows-driver-samples IddSampleDriver and the `windows-2025-vs2026` GitHub runner, then uploads `displayPost-x64` containing `displayPost.exe` and the driver package.
+GitHub Actions builds `displayPost.exe` with Visual Studio/MSBuild and uploads the executable as the `displayPost-x64` artifact.
 
-## Run
-
-Place the artifact as:
-
-```text
-displayPost.exe
-driver/
-  IddSampleDriver.inf
-  IddSampleDriver.dll
-  IddSampleDriver.cat
-```
-
-Run `displayPost.exe`, enter for example:
-
-```text
-http://192.168.1.100:8080
-```
-
-The program requests elevation because adding a driver package requires administrator privileges. `pnputil` is used to add/install the INF, and the software device is then created by the application.
-
-## Architecture
-
-```text
-Windows DWM
-    |
-    v
-IddSampleDriver -> virtual monitor
-    ^
-    | SwDeviceCreate
-    |
-displayPost.exe
-    |
-    +-- GET /fbinfo
-    +-- GDI capture virtual monitor
-    +-- BGRA/XRGB -> RGB565
-    +-- POST /fb (continuous fixed-size frames)
-    |
-    v
-X1830 /dev/fb0
-```
-
-The driver portion is based on Microsoft's Indirect Display Driver sample. See the Microsoft Windows Driver Samples repository for the upstream sample and licensing information.
+This direct-capture version intentionally does not install or require an IDD driver. The IDD work can be added later when the virtual-monitor source path is needed.
