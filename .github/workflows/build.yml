@@ -1,61 +1,23 @@
 name: Build displayPost
-
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
-
       - name: Build client
         run: msbuild displayPost.vcxproj /m /p:Configuration=Release /p:Platform=x64
-
-      - name: Fetch Microsoft IddSampleDriver
+      - name: Package
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/microsoft/Windows-driver-samples.git _driver-samples
-          $src = Join-Path $PWD '_driver-samples/video/IndirectDisplay/IddSampleDriver'
-          $driverCpp = Join-Path $src 'Driver.cpp'
-          $text = Get-Content $driverCpp -Raw
-          $text = $text -replace 'static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 3;', 'static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 1;'
-          $text = $text -replace '\{ 1920, 1080, 60 \},\s*\{ 1600,  900, 60 \},\s*\{ 1024,  768, 75 \},', '{ 800, 480, 60 },\n    { 1024, 600, 60 },\n    { 1280, 720, 60 },'
-          $text = $text -replace 'if \(ConnectorIndex >= ARRAYSIZE\(s_SampleMonitors\)\)', 'if (true)'
-          Set-Content -Path $driverCpp -Value $text -Encoding UTF8
-          $inf = Join-Path $src 'IddSampleDriver.inf'
-          $it = Get-Content $inf -Raw
-          $it = $it -replace 'Root\\IddSampleDriver', 'Root\\DisplayPost'
-          $it = $it -replace 'IddSampleDriver      ; TODO: edit hw-id', 'DisplayPost          ; TODO: edit hw-id'
-          Set-Content -Path $inf -Value $it -Encoding UTF8
-
-      - name: Restore WDK packages
-        shell: pwsh
-        run: nuget restore _driver-samples/packages.config -PackagesDirectory _driver-samples/packages
-
-      - name: Build IddSampleDriver
-        shell: pwsh
-        run: |
-          msbuild _driver-samples/video/IndirectDisplay/IddSampleDriver/IddSampleDriver.vcxproj /m /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off
-
-      - name: Assemble package
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force package/driver | Out-Null
+          New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item bin/x64/Release/displayPost.exe package/displayPost.exe
-          $dll = Get-ChildItem _driver-samples/video/IndirectDisplay/IddSampleDriver -Recurse -Filter IddSampleDriver.dll | Where-Object { $_.FullName -match 'x64' -and $_.FullName -match 'Release' } | Select-Object -First 1
-          if (-not $dll) { throw 'IddSampleDriver.dll not found' }
-          Copy-Item $dll.FullName package/driver/IddSampleDriver.dll
-          Copy-Item _driver-samples/video/IndirectDisplay/IddSampleDriver/IddSampleDriver.inf package/driver/IddSampleDriver.inf
-          $cat = Get-ChildItem _driver-samples/video/IndirectDisplay/IddSampleDriver -Recurse -Filter IddSampleDriver.cat | Select-Object -First 1
-          if ($cat) { Copy-Item $cat.FullName package/driver/IddSampleDriver.cat }
           Copy-Item README.md package/README.md
-
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
