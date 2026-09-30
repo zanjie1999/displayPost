@@ -1068,6 +1068,7 @@ public:
             L"Content-Type: "
             L"multipart/x-mixed-replace; "
             L"boundary=ffmpeg\r\n"
+            L"Transfer-Encoding: chunked\r\n"
             L"Expect:\r\n";
 
         /*
