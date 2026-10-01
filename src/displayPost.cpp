@@ -4,6 +4,8 @@
 #include <winhttp.h>
 #include <gdiplus.h>
 #include <objidl.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +26,8 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 struct Fb {
     int w = 0;
@@ -50,6 +54,9 @@ struct Url {
     INTERNET_PORT port = 0;
     bool tls = false;
 };
+
+// Set when the executable was launched without command-line parameters.
+static bool gInteractiveLaunch = false;
 
 static bool Crack(const std::wstring& input, Url& out) {
     URL_COMPONENTS components{};
@@ -598,65 +605,61 @@ public:
 };
 
 class Capture {
-    Fb fb_;
+    Fb fb_{};
     int rotation_ = 0;
+    std::vector<BYTE> pixels_;
+    ID3D11Device* device_ = nullptr;
+    ID3D11DeviceContext* context_ = nullptr;
+    IDXGIOutputDuplication* duplication_ = nullptr;
+    ID3D11Texture2D* staging_ = nullptr;
+    int outputLeft_ = 0, outputTop_ = 0, outputWidth_ = 0, outputHeight_ = 0;
 
-    HDC screen_ = nullptr;
-    HDC dc_ = nullptr;
-    HDC scratchDc_ = nullptr;
+    void ReleaseDuplication() {
+        if (staging_) { staging_->Release(); staging_ = nullptr; }
+        if (duplication_) { duplication_->Release(); duplication_ = nullptr; }
+        if (context_) { context_->Release(); context_ = nullptr; }
+        if (device_) { device_->Release(); device_ = nullptr; }
+    }
 
-    HBITMAP bitmap_ = nullptr;
-    HBITMAP scratchBitmap_ = nullptr;
-
-    void* bits_ = nullptr;
-    void* scratchBits_ = nullptr;
-
-    HGDIOBJ oldBitmap_ = nullptr;
-    HGDIOBJ oldScratchBitmap_ = nullptr;
-
-    int scratchWidth_ = 0;
-    int scratchHeight_ = 0;
-
-    bool CreateDib(
-        HDC dc,
-        int width,
-        int height,
-        HBITMAP& bitmap,
-        void*& bits,
-        HGDIOBJ& oldBitmap) {
-
-        BITMAPINFO info{};
-        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = width;
-        info.bmiHeader.biHeight = -height;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-
-        bitmap = CreateDIBSection(
-            dc,
-            &info,
-            DIB_RGB_COLORS,
-            &bits,
-            nullptr,
-            0);
-
-        if (!bitmap) {
-            return false;
+    bool OpenOutput(const RECT& source) {
+        ReleaseDuplication();
+        IDXGIFactory1* factory = nullptr;
+        if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return false;
+        IDXGIAdapter1* adapter = nullptr; IDXGIOutput* output = nullptr;
+        RECT hit{}; bool found = false;
+        POINT p{(source.left + source.right) / 2, (source.top + source.bottom) / 2};
+        for (UINT ai = 0; !found && factory->EnumAdapters1(ai, &adapter) != DXGI_ERROR_NOT_FOUND; ++ai) {
+            for (UINT oi = 0; adapter->EnumOutputs(oi, &output) != DXGI_ERROR_NOT_FOUND; ++oi) {
+                DXGI_OUTPUT_DESC d{}; output->GetDesc(&d);
+                if (PtInRect(&d.DesktopCoordinates, p)) { hit = d.DesktopCoordinates; found = true; break; }
+                output->Release(); output = nullptr;
+            }
+            if (!found) { adapter->Release(); adapter = nullptr; }
         }
-
-        oldBitmap = SelectObject(dc, bitmap);
-        if (!oldBitmap || oldBitmap == HGDI_ERROR) {
-            DeleteObject(bitmap);
-            bitmap = nullptr;
-            bits = nullptr;
-            return false;
-        }
-
-        SetStretchBltMode(dc, COLORONCOLOR);
+        if (!found) { factory->Release(); return false; }
+        ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
+        D3D_FEATURE_LEVEL fl{};
+        HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &dev, &fl, &ctx);
+        IDXGIOutput1* output1 = nullptr;
+        if (SUCCEEDED(hr)) hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
+        IDXGIOutputDuplication* dup = nullptr;
+        if (SUCCEEDED(hr)) hr = output1->DuplicateOutput(dev, &dup);
+        if (output1) output1->Release(); output->Release(); adapter->Release(); factory->Release();
+        if (FAILED(hr)) { if (ctx) ctx->Release(); if (dev) dev->Release(); return false; }
+        DXGI_OUTDUPL_DESC dd{}; dup->GetDesc(&dd);
+        D3D11_TEXTURE2D_DESC td{}; td.Width = dd.ModeDesc.Width; td.Height = dd.ModeDesc.Height;
+        td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D* staging = nullptr;
+        hr = dev->CreateTexture2D(&td, nullptr, &staging);
+        if (FAILED(hr)) { dup->Release(); ctx->Release(); dev->Release(); return false; }
+        device_ = dev; context_ = ctx; duplication_ = dup; staging_ = staging;
+        outputLeft_ = hit.left; outputTop_ = hit.top; outputWidth_ = (int)td.Width; outputHeight_ = (int)td.Height;
         return true;
     }
 
+    /* DXGI supplies BGRA pixels; scaling and rotation are applied while copying. */
     static void Rotate90CW(
         const BYTE* src,
         int srcWidth,
@@ -775,99 +778,31 @@ class Capture {
     }
 
 public:
-    ~Capture() {
-        if (dc_ && oldBitmap_) {
-            SelectObject(dc_, oldBitmap_);
-        }
-
-        if (scratchDc_ && oldScratchBitmap_) {
-            SelectObject(scratchDc_, oldScratchBitmap_);
-        }
-
-        if (bitmap_) {
-            DeleteObject(bitmap_);
-        }
-
-        if (scratchBitmap_) {
-            DeleteObject(scratchBitmap_);
-        }
-
-        if (dc_) {
-            DeleteDC(dc_);
-        }
-
-        if (scratchDc_) {
-            DeleteDC(scratchDc_);
-        }
-
-        if (screen_) {
-            ReleaseDC(nullptr, screen_);
-        }
-    }
+    ~Capture() { ReleaseDuplication(); }
 
     bool Init(const Fb& fb, int rotation) {
-        fb_ = fb;
-        rotation_ = rotation;
-
-        screen_ = GetDC(nullptr);
-        if (!screen_) {
-            return false;
-        }
-
-        dc_ = CreateCompatibleDC(screen_);
-        if (!dc_) {
-            return false;
-        }
-
-        if (!CreateDib(
-                dc_,
-                fb.w,
-                fb.h,
-                bitmap_,
-                bits_,
-                oldBitmap_)) {
-            return false;
-        }
-
-        scratchDc_ = CreateCompatibleDC(screen_);
-        if (!scratchDc_) {
-            return false;
-        }
-
-        /*
-            90/270 degrees need a temporary image whose
-            dimensions are swapped. A square scratch bitmap
-            of max(width,height) is enough because the scaled
-            pre-rotation image always fits inside the target.
-        */
-        scratchWidth_ = std::max(fb.w, fb.h);
-        scratchHeight_ = std::max(fb.w, fb.h);
-
-        if (!CreateDib(
-                scratchDc_,
-                scratchWidth_,
-                scratchHeight_,
-                scratchBitmap_,
-                scratchBits_,
-                oldScratchBitmap_)) {
-            return false;
-        }
-
-        return true;
+        fb_ = fb; rotation_ = rotation; pixels_.assign((size_t)fb.w * fb.h * 4, 0); return true;
     }
 
     bool CaptureFrame(const RECT& source) {
-        const int sourceWidth =
-            source.right - source.left;
-        const int sourceHeight =
-            source.bottom - source.top;
-
-        if (sourceWidth <= 0 || sourceHeight <= 0) {
-            return false;
+        const int sourceWidth = source.right - source.left, sourceHeight = source.bottom - source.top;
+        if (sourceWidth <= 0 || sourceHeight <= 0 || fb_.w <= 0 || fb_.h <= 0) return false;
+        if (!duplication_ || source.left < outputLeft_ || source.top < outputTop_ ||
+            source.right > outputLeft_ + outputWidth_ || source.bottom > outputTop_ + outputHeight_) {
+            if (!OpenOutput(source)) return false;
         }
+        DXGI_OUTDUPL_FRAME_INFO fi{}; IDXGIResource* resource = nullptr;
+        HRESULT hr = duplication_->AcquireNextFrame(100, &fi, &resource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
+        if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_DEVICE_REMOVED) { ReleaseDuplication(); return false; }
+        if (FAILED(hr)) return false;
+        ID3D11Texture2D* frame = nullptr; hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&frame);
+        if (SUCCEEDED(hr)) { context_->CopyResource(staging_, frame); frame->Release(); }
+        resource->Release(); duplication_->ReleaseFrame();
+        if (FAILED(hr)) return false;
+        D3D11_MAPPED_SUBRESOURCE map{}; if (FAILED(context_->Map(staging_, 0, D3D11_MAP_READ, 0, &map))) return false;
 
-        const bool quarterTurn =
-            rotation_ == 90 || rotation_ == 270;
+        const bool quarterTurn = rotation_ == 90 || rotation_ == 270;
 
         /*
             Work out the aspect ratio of the image AFTER
@@ -909,148 +844,25 @@ public:
         const int top =
             (fb_.h - contentHeight) / 2;
 
-        const RECT fullTarget{
-            0,
-            0,
-            fb_.w,
-            fb_.h
-        };
-
-        FillRect(
-            dc_,
-            &fullTarget,
-            static_cast<HBRUSH>(
-                GetStockObject(BLACK_BRUSH)));
-
-        if (rotation_ == 0) {
-            return StretchBlt(
-                       dc_,
-                       left,
-                       top,
-                       contentWidth,
-                       contentHeight,
-                       screen_,
-                       source.left,
-                       source.top,
-                       sourceWidth,
-                       sourceHeight,
-                       SRCCOPY) != FALSE;
+        std::fill(pixels_.begin(), pixels_.end(), 0);
+        const BYTE* src = (const BYTE*)map.pData;
+        const int srcStride = (int)map.RowPitch;
+        for (int y=0; y<contentHeight; ++y) for (int x=0; x<contentWidth; ++x) {
+            int ux=x, uy=y;
+            if (rotation_ == 90) { ux = (int)((long long)y * sourceWidth / contentHeight); uy = sourceHeight - 1 - (int)((long long)x * sourceHeight / contentWidth); }
+            else if (rotation_ == 180) { ux = sourceWidth - 1 - (int)((long long)x * sourceWidth / contentWidth); uy = sourceHeight - 1 - (int)((long long)y * sourceHeight / contentHeight); }
+            else if (rotation_ == 270) { ux = sourceWidth - 1 - (int)((long long)y * sourceWidth / contentHeight); uy = (int)((long long)x * sourceHeight / contentWidth); }
+            else { ux = (int)((long long)x * sourceWidth / contentWidth); uy = (int)((long long)y * sourceHeight / contentHeight); }
+            int sx = source.left - outputLeft_ + ux, sy = source.top - outputTop_ + uy;
+            BYTE* q = pixels_.data() + ((size_t)(top+y)*fb_.w + left+x)*4;
+            memcpy(q, src + (size_t)sy*srcStride + sx*4, 4);
         }
+        context_->Unmap(staging_, 0); return true;
 
-        /*
-            Before rotation, the scaled image has swapped
-            dimensions for 90/270 degrees.
-
-                final content: contentWidth x contentHeight
-                pre-rotate:     contentHeight x contentWidth
-        */
-        const int preWidth =
-            quarterTurn
-                ? contentHeight
-                : contentWidth;
-
-        const int preHeight =
-            quarterTurn
-                ? contentWidth
-                : contentHeight;
-
-        if (preWidth <= 0 ||
-            preHeight <= 0 ||
-            preWidth > scratchWidth_ ||
-            preHeight > scratchHeight_) {
-            return false;
-        }
-
-        const RECT scratchRect{
-            0,
-            0,
-            preWidth,
-            preHeight
-        };
-
-        FillRect(
-            scratchDc_,
-            &scratchRect,
-            static_cast<HBRUSH>(
-                GetStockObject(BLACK_BRUSH)));
-
-        if (!StretchBlt(
-                scratchDc_,
-                0,
-                0,
-                preWidth,
-                preHeight,
-                screen_,
-                source.left,
-                source.top,
-                sourceWidth,
-                sourceHeight,
-                SRCCOPY)) {
-            return false;
-        }
-
-        const BYTE* src =
-            static_cast<const BYTE*>(scratchBits_);
-
-        BYTE* dst =
-            static_cast<BYTE*>(bits_);
-
-        const int srcStride =
-            scratchWidth_ * 4;
-
-        const int dstStride =
-            fb_.w * 4;
-
-        switch (rotation_) {
-        case 90:
-            Rotate90CW(
-                src,
-                preWidth,
-                preHeight,
-                srcStride,
-                dst,
-                fb_.w,
-                fb_.h,
-                dstStride,
-                left,
-                top);
-            return true;
-
-        case 180:
-            Rotate180(
-                src,
-                preWidth,
-                preHeight,
-                srcStride,
-                dst,
-                fb_.w,
-                fb_.h,
-                dstStride,
-                left,
-                top);
-            return true;
-
-        case 270:
-            Rotate90CCW(
-                src,
-                preWidth,
-                preHeight,
-                srcStride,
-                dst,
-                fb_.w,
-                fb_.h,
-                dstStride,
-                left,
-                top);
-            return true;
-
-        default:
-            return false;
-        }
     }
 
     const BYTE* Pixels() const {
-        return static_cast<const BYTE*>(bits_);
+        return pixels_.data();
     }
 
     int Width() const {
@@ -1144,21 +956,30 @@ class Stream {
     }
 
 public:
-    ~Stream() {
+    void Close() {
         if (request_) {
             WinHttpCloseHandle(request_);
+            request_ = nullptr;
         }
 
         if (connect_) {
             WinHttpCloseHandle(connect_);
+            connect_ = nullptr;
         }
 
         if (session_) {
             WinHttpCloseHandle(session_);
+            session_ = nullptr;
         }
     }
 
+    ~Stream() {
+        Close();
+    }
+
     bool Open(const std::wstring& baseUrl) {
+        Close();
+
         Url url;
 
         if (!Crack(baseUrl, url)) {
@@ -1382,6 +1203,7 @@ int wmain(
     }
 
     if (argc < 2) {
+        gInteractiveLaunch = true;
         std::wstring input;
 
         std::wcout << L"workdayAlarmClockGo URL: ";
@@ -1488,6 +1310,13 @@ int wmain(
                 "rotation must be 0, 90, 180, or 270 degrees");
         }
 
+        std::wcout << L"Configuration:\n"
+                   << L"  URL: " << url << L"\n"
+                   << L"  FPS: " << fps << L"\n"
+                   << L"  Monitor: " << monitorIndex << L"\n"
+                   << L"  Rotation: " << rotation << L"\n"
+                   << L"Starting transmission..." << std::endl;
+
         Capture capture;
 
         if (!capture.Init(fb, static_cast<int>(rotation))) {
@@ -1497,11 +1326,6 @@ int wmain(
 
         JpegEncoder encoder;
         Stream stream;
-
-        if (!stream.Open(url)) {
-            throw std::runtime_error(
-                "failed to open /fb MJPEG stream");
-        }
 
         std::vector<BYTE> jpeg;
 
@@ -1514,15 +1338,65 @@ int wmain(
 
         uint64_t sentFrames = 0;
 
+        const bool interactiveMode = gInteractiveLaunch;
+        bool connected = false;
+        bool everConnected = false;
+        auto nextReconnect = std::chrono::steady_clock::now();
+        int interactiveRetries = 0;
+
         const RECT monitorRect =
             monitors[
                 static_cast<size_t>(monitorIndex - 1)
             ].rect;
 
         for (;;) {
+            if (!connected) {
+                if (!interactiveMode &&
+                    std::chrono::steady_clock::now() < nextReconnect) {
+                    std::this_thread::sleep_until(nextReconnect);
+                }
+                if (interactiveMode && everConnected && interactiveRetries < 3) {
+                    std::cout << "Disconnected. Retrying in 3 seconds."
+                              << std::endl;
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                }
+                if (!interactiveMode && everConnected) {
+                    std::cout << "Disconnected. Retrying in 10 seconds."
+                              << std::endl;
+                }
+
+                connected = stream.Open(url);
+                if (!connected) {
+                    if (interactiveMode) {
+                        ++interactiveRetries;
+                        if (interactiveRetries >= 3) {
+                            std::cout << "Connection failed 3 times. Press Enter to retry."
+                                      << std::endl;
+                            std::wstring line;
+                            std::getline(std::wcin, line);
+                            interactiveRetries = 0;
+                        } else {
+                            std::cout << "Connection failed. Retrying in 3 seconds."
+                                      << std::endl;
+                            std::this_thread::sleep_for(std::chrono::seconds(3));
+                        }
+                    } else {
+                        nextReconnect =
+                            std::chrono::steady_clock::now() +
+                            std::chrono::seconds(10);
+                    }
+                    continue;
+                }
+
+                everConnected = true;
+                interactiveRetries = 0;
+                std::cout << "Connected. Transmission started." << std::endl;
+                nextFrame = std::chrono::steady_clock::now();
+            }
+
             if (!capture.CaptureFrame(monitorRect)) {
-                throw std::runtime_error(
-                    "capture frame failed");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
             }
 
             if (!encoder.Encode(
@@ -1536,9 +1410,14 @@ int wmain(
             }
 
             if (!stream.WriteFrame(jpeg)) {
-                throw std::runtime_error(
-                    "MJPEG stream write failed at frame " +
-                    std::to_string(sentFrames + 1));
+                connected = false;
+                stream.Close();
+                if (!interactiveMode) {
+                    nextReconnect =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(10);
+                }
+                continue;
             }
 
             ++sentFrames;
