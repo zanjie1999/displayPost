@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <conio.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -997,6 +998,13 @@ public:
             return false;
         }
 
+        WinHttpSetTimeouts(
+            session_,
+            5000,
+            5000,
+            5000,
+            5000);
+
         connect_ = WinHttpConnect(
             session_,
             url.host.c_str(),
@@ -1202,41 +1210,91 @@ int wmain(
         SetProcessDPIAware();
     }
 
-    if (argc < 2) {
-        gInteractiveLaunch = true;
-        std::wstring input;
-
-        std::wcout << L"workdayAlarmClockGo URL: ";
-        std::getline(std::wcin, input);
-        if (input.empty()) {
-            std::wcerr << L"URL is empty\n";
-            return 2;
+    if (argc >= 2 && argc < 5) {
+        std::vector<std::wstring> fixedArgs;
+        for (int i = 0; i < argc; ++i) {
+            fixedArgs.push_back(argv[i]);
         }
 
+        while (fixedArgs.size() < 5) {
+            if (fixedArgs.size() == 2) fixedArgs.push_back(L"30");
+            else if (fixedArgs.size() == 3) fixedArgs.push_back(L"1");
+            else if (fixedArgs.size() == 4) fixedArgs.push_back(L"0");
+        }
+
+        std::vector<wchar_t*> fixedArgv;
+        for (auto& a : fixedArgs) {
+            fixedArgv.push_back(const_cast<wchar_t*>(a.c_str()));
+        }
+
+        return wmain(static_cast<int>(fixedArgv.size()), fixedArgv.data());
+    }
+
+    if (argc < 5) {
+        gInteractiveLaunch = true;
+
+        std::vector<std::wstring> args;
+        args.reserve(5);
+        args.push_back(argv[0]);
+
+        std::wstring urlInput;
         std::wstring fpsInput;
         std::wstring monitorInput;
         std::wstring rotationInput;
 
-        std::wcout << L"fps (default 30): ";
-        std::getline(std::wcin, fpsInput);
-        std::wcout << L"monitor (default 1): ";
-        std::getline(std::wcin, monitorInput);
-        std::wcout << L"rotation (0/90/180/270 default 0): ";
-        std::getline(std::wcin, rotationInput);
+        if (argc >= 2) {
+            urlInput = argv[1];
+        } else {
+            std::wcout << L"workdayAlarmClockGo URL: ";
+            std::getline(std::wcin, urlInput);
+            if (urlInput.empty()) {
+                std::wcerr << L"URL is empty\n";
+                return 2;
+            }
+        }
 
-        const std::wstring normalizedUrl = NormalizeUrl(input);
-        const std::wstring fps = fpsInput.empty() ? L"30" : fpsInput;
-        const std::wstring monitor =
-            monitorInput.empty() ? L"1" : monitorInput;
-        const std::wstring rotation =
-            rotationInput.empty() ? L"0" : rotationInput;
+        if (argc >= 3) {
+            fpsInput = argv[2];
+        } else {
+            std::wcout << L"fps (default 30): ";
+            std::getline(std::wcin, fpsInput);
+        }
 
-        std::vector<wchar_t*> interactiveArgs{
-            argv[0],
-            const_cast<wchar_t*>(normalizedUrl.c_str()),
-            const_cast<wchar_t*>(fps.c_str()),
-            const_cast<wchar_t*>(monitor.c_str()),
-            const_cast<wchar_t*>(rotation.c_str())};
+        if (argc >= 4) {
+            monitorInput = argv[3];
+        } else {
+            std::wcout << L"monitor (default 1): ";
+            std::getline(std::wcin, monitorInput);
+        }
+
+        if (argc >= 5) {
+            rotationInput = argv[4];
+        } else {
+            std::wcout << L"rotation (0/90/180/270 default 0): ";
+            std::getline(std::wcin, rotationInput);
+        }
+
+        if (fpsInput.empty()) {
+            fpsInput = L"30";
+        }
+        if (monitorInput.empty()) {
+            monitorInput = L"1";
+        }
+        if (rotationInput.empty()) {
+            rotationInput = L"0";
+        }
+
+        const std::wstring normalizedUrl = NormalizeUrl(urlInput);
+
+        args.push_back(normalizedUrl);
+        args.push_back(fpsInput);
+        args.push_back(monitorInput);
+        args.push_back(rotationInput);
+
+        std::vector<wchar_t*> interactiveArgs;
+        for (auto& arg : args) {
+            interactiveArgs.push_back(const_cast<wchar_t*>(arg.c_str()));
+        }
 
         return wmain(
             static_cast<int>(interactiveArgs.size()),
@@ -1343,6 +1401,7 @@ int wmain(
         bool everConnected = false;
         auto nextReconnect = std::chrono::steady_clock::now();
         int interactiveRetries = 0;
+        bool forceReconnect = false;
 
         const RECT monitorRect =
             monitors[
@@ -1350,12 +1409,24 @@ int wmain(
             ].rect;
 
         for (;;) {
+            if (interactiveMode && _kbhit()) {
+                int ch = _getch();
+                if (ch == 13) {
+                    std::cout << "Manual reconnect requested." << std::endl;
+                    connected = false;
+                    stream.Close();
+                    interactiveRetries = 0;
+                    forceReconnect = true;
+                    continue;
+                }
+            }
+
             if (!connected) {
                 if (!interactiveMode &&
                     std::chrono::steady_clock::now() < nextReconnect) {
                     std::this_thread::sleep_until(nextReconnect);
                 }
-                if (interactiveMode && everConnected && interactiveRetries < 3) {
+                if (interactiveMode && everConnected && interactiveRetries < 3 && !forceReconnect) {
                     std::cout << "Disconnected. Retrying in 3 seconds."
                               << std::endl;
                     std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -1375,6 +1446,7 @@ int wmain(
                             std::wstring line;
                             std::getline(std::wcin, line);
                             interactiveRetries = 0;
+                            forceReconnect = true;
                         } else {
                             std::cout << "Connection failed. Retrying in 3 seconds."
                                       << std::endl;
@@ -1390,6 +1462,7 @@ int wmain(
 
                 everConnected = true;
                 interactiveRetries = 0;
+                forceReconnect = false;
                 std::cout << "Connected. Transmission started." << std::endl;
                 nextFrame = std::chrono::steady_clock::now();
             }
