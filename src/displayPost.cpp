@@ -1370,6 +1370,7 @@ int wmain(
 
         std::wcout << L"Configuration:\n"
                    << L"  URL: " << url << L"\n"
+                   << L"  Framebuffer: " << fb.w << L"x" << fb.h << L"\n"
                    << L"  FPS: " << fps << L"\n"
                    << L"  Monitor: " << monitorIndex << L"\n"
                    << L"  Rotation: " << rotation << L"\n"
@@ -1401,6 +1402,7 @@ int wmain(
         bool everConnected = false;
         auto nextReconnect = std::chrono::steady_clock::now();
         int interactiveRetries = 0;
+        int autoReconnectRetries = 0;
         bool forceReconnect = false;
 
         const RECT monitorRect =
@@ -1427,13 +1429,20 @@ int wmain(
                     std::this_thread::sleep_until(nextReconnect);
                 }
                 if (interactiveMode && everConnected && interactiveRetries < 3 && !forceReconnect) {
-                    std::cout << "Disconnected. Retrying in 3 seconds."
+                    std::cout << "Disconnected. Retrying in 1 seconds (" << interactiveRetries + 1 << "/3)..."
                               << std::endl;
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
                 if (!interactiveMode && everConnected) {
-                    std::cout << "Disconnected. Retrying in 10 seconds."
-                              << std::endl;
+                    if (autoReconnectRetries < 3) {
+                        std::cout << "Disconnected. Retrying in 1 second (" << autoReconnectRetries + 1 << "/3)..."
+                                  << std::endl;
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    } else {
+                        std::cout << "Disconnected. Retrying in 10 seconds (" << autoReconnectRetries + 1 << "/3)..."
+                                  << std::endl;
+                        std::this_thread::sleep_for(std::chrono::seconds(10));
+                    }
                 }
 
                 connected = stream.Open(url);
@@ -1448,20 +1457,22 @@ int wmain(
                             interactiveRetries = 0;
                             forceReconnect = true;
                         } else {
-                            std::cout << "Connection failed. Retrying in 3 seconds."
+                            std::cout << "Connection failed. Retrying in 1 seconds (" << interactiveRetries + 1 << "/3)..."
                                       << std::endl;
-                            std::this_thread::sleep_for(std::chrono::seconds(3));
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
                         }
                     } else {
-                        nextReconnect =
-                            std::chrono::steady_clock::now() +
-                            std::chrono::seconds(10);
+                        ++autoReconnectRetries;
+                        if (autoReconnectRetries > 3) {
+                            autoReconnectRetries = 3;
+                        }
                     }
                     continue;
                 }
 
                 everConnected = true;
                 interactiveRetries = 0;
+                autoReconnectRetries = 0;
                 forceReconnect = false;
                 std::cout << "Connected. Transmission started." << std::endl;
                 nextFrame = std::chrono::steady_clock::now();
@@ -1486,9 +1497,10 @@ int wmain(
                 connected = false;
                 stream.Close();
                 if (!interactiveMode) {
-                    nextReconnect =
-                        std::chrono::steady_clock::now() +
-                        std::chrono::seconds(10);
+                    ++autoReconnectRetries;
+                    if (autoReconnectRetries > 3) {
+                        autoReconnectRetries = 3;
+                    }
                 }
                 continue;
             }
