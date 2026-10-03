@@ -1411,7 +1411,7 @@ int wmain(
             ].rect;
 
         for (;;) {
-            if (interactiveMode && _kbhit()) {
+            if (_kbhit()) {
                 int ch = _getch();
                 if (ch == 13) {
                     std::cout << "Manual reconnect requested." << std::endl;
