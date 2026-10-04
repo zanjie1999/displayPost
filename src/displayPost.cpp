@@ -1324,7 +1324,7 @@ int wmain(
                 ? ParseUnsigned(argv[2])
                 : 30;
 
-        const uint64_t monitorIndex =
+        uint64_t monitorIndex =
             argc > 3
                 ? ParseUnsigned(argv[3])
                 : 1;
@@ -1340,9 +1340,8 @@ int wmain(
                 "fps must be between 1 and 1000");
         }
 
-        if (monitorIndex == 0) {
-            throw std::runtime_error(
-                "monitor must be >= 1");
+        if (monitorIndex < 1) {
+            monitorIndex = 1;
         }
 
         const Fb fb = ReadFbInfo(url);
@@ -1356,8 +1355,7 @@ int wmain(
         }
 
         if (monitorIndex > monitors.size()) {
-            throw std::runtime_error(
-                "monitor out of range");
+            monitorIndex = monitors.size();
         }
 
         if (rotation != 0 &&
