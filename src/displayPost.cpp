@@ -495,6 +495,7 @@ public:
         int width,
         int height,
         int stride,
+        ULONG quality,
         std::vector<BYTE>& jpeg) {
 
         if (!pixels ||
@@ -524,8 +525,6 @@ public:
                 &stream))) {
             return false;
         }
-
-        ULONG quality = 80;
 
         Gdiplus::EncoderParameters parameters{};
         parameters.Count = 1;
@@ -1288,17 +1287,18 @@ int wmain(
         SetProcessDPIAware();
     }
 
-    if (argc >= 2 && argc < 6) {
+    if (argc >= 2 && argc < 7) {
         std::vector<std::wstring> fixedArgs;
         for (int i = 0; i < argc; ++i) {
             fixedArgs.push_back(argv[i]);
         }
 
-        while (fixedArgs.size() < 6) {
+        while (fixedArgs.size() < 7) {
             if (fixedArgs.size() == 2) fixedArgs.push_back(L"30");
             else if (fixedArgs.size() == 3) fixedArgs.push_back(L"1");
             else if (fixedArgs.size() == 4) fixedArgs.push_back(L"0");
-            else if (fixedArgs.size() == 5) fixedArgs.push_back(L"0");
+            else if (fixedArgs.size() == 5) fixedArgs.push_back(L"90");
+            else if (fixedArgs.size() == 6) fixedArgs.push_back(L"0");
         }
 
         std::vector<wchar_t*> fixedArgv;
@@ -1313,13 +1313,15 @@ int wmain(
         gInteractiveLaunch = true;
 
         std::vector<std::wstring> args;
-        args.reserve(5);
+        args.reserve(7);
         args.push_back(argv[0]);
 
         std::wstring urlInput;
         std::wstring fpsInput;
         std::wstring monitorInput;
         std::wstring rotationInput;
+        std::wstring qualityInput;
+        std::wstring colorModeInput;
 
         if (argc >= 2) {
             urlInput = argv[1];
@@ -1362,6 +1364,16 @@ int wmain(
         if (rotationInput.empty()) {
             rotationInput = L"0";
         }
+        // std::wcout << L"JPEG quality (0-100, default 75): ";
+        // std::getline(std::wcin, qualityInput);
+        if (qualityInput.empty()) {
+            qualityInput = L"75";
+        }
+        // std::wcout << L"color mode (0-5, default 0): ";
+        // std::getline(std::wcin, colorModeInput);
+        if (colorModeInput.empty()) {
+            colorModeInput = L"0";
+        }
 
         const std::wstring normalizedUrl = NormalizeUrl(urlInput);
 
@@ -1369,6 +1381,8 @@ int wmain(
         args.push_back(fpsInput);
         args.push_back(monitorInput);
         args.push_back(rotationInput);
+        args.push_back(qualityInput);
+        args.push_back(colorModeInput);
 
         std::vector<wchar_t*> interactiveArgs;
         for (auto& arg : args) {
@@ -1414,9 +1428,14 @@ int wmain(
                 ? ParseUnsigned(argv[4])
                 : 0;
 
-        const uint64_t colorModeValue =
+        const uint64_t jpegQuality =
             argc > 5
                 ? ParseUnsigned(argv[5])
+                : 90;
+
+        const uint64_t colorModeValue =
+            argc > 6
+                ? ParseUnsigned(argv[6])
                 : 0;
 
         if (fps == 0 || fps > 1000) {
@@ -1450,6 +1469,11 @@ int wmain(
                 "rotation must be 0, 90, 180, or 270 degrees");
         }
 
+        if (jpegQuality > 100) {
+            throw std::runtime_error(
+                "JPEG quality must be between 0 and 100");
+        }
+
         if (colorModeValue > static_cast<uint64_t>(ColorMode::Binary)) {
             throw std::runtime_error(
                 "color mode must be between 0 and 5");
@@ -1462,6 +1486,7 @@ int wmain(
                    << L"  FPS: " << fps << L"\n"
                    << L"  Monitor: " << monitorIndex << L"\n"
                    << L"  Rotation: " << rotation << L"\n"
+                   << L"  JPEG quality: " << jpegQuality << L"\n"
                    << L"  Color mode: " << colorModeValue << L"\n"
                    << L"Starting transmission..." << std::endl;
 
@@ -1591,6 +1616,7 @@ int wmain(
                     capture.Width(),
                     capture.Height(),
                     capture.Stride(),
+                    static_cast<ULONG>(jpegQuality),
                     jpeg)) {
                 throw std::runtime_error(
                     "JPEG encode failed");
@@ -1633,5 +1659,4 @@ int wmain(
         return 1;
     }
 }
-
 

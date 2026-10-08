@@ -8,18 +8,18 @@
 直接双击运行也行
 
 ```cmd
-displayPost.exe <url> [fps=30] [monitor=1] [rotation=0] [color=0]
+displayPost.exe <url> [fps=30] [monitor=1] [rotation=0] [quality=90] [color=0]
 ```
 
 - `url`: 工作咩闹钟Web后台地址，比如 `http://192.168.1.154:8080`
 - `fps`: 每秒帧率，默认 `30`
 - `monitor`: Windows的显示器编号，默认 `1`
 - `rotation`: 屏幕旋转，0/90/180/270，默认不转
+- `quality`: JPEG图像质量，范围 `0` 到 `100`，默认 `75`
 - `color`: 色彩处理模式：0 自动（默认），1 彩色，2 灰度，3 Floyd-Steinberg 黑白抖动，4 Bayer 4x4 黑白抖动，5 二值化黑白
 
 比如:
 ```cmd
-displayPost.exe http://192.168.2.195:8080/ 30 1 90
+displayPost.exe http://192.168.2.195:8080/ 30 1 90 75
 ```
-
 
