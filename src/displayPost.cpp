@@ -879,6 +879,84 @@ public:
     }
 };
 
+
+enum class ColorMode : uint64_t {
+    Auto = 0,
+    Color = 1,
+    Grayscale = 2,
+    FloydSteinberg = 3,
+    Bayer4x4 = 4,
+    Binary = 5,
+};
+
+static BYTE Luminance(const BYTE* pixel) {
+    return static_cast<BYTE>((static_cast<unsigned>(pixel[2]) * 299u +
+                              static_cast<unsigned>(pixel[1]) * 587u +
+                              static_cast<unsigned>(pixel[0]) * 114u + 500u) / 1000u);
+}
+
+static void ApplyColorMode(std::vector<BYTE>& pixels, int width, int height, ColorMode mode) {
+    if (mode == ColorMode::Auto || mode == ColorMode::Color) {
+        return;
+    }
+
+    const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (mode == ColorMode::Grayscale) {
+        for (size_t i = 0; i < count; ++i) {
+            BYTE* p = pixels.data() + i * 4;
+            const BYTE y = Luminance(p);
+            p[0] = p[1] = p[2] = y;
+        }
+        return;
+    }
+
+    if (mode == ColorMode::FloydSteinberg) {
+        std::vector<float> values(count);
+        for (size_t i = 0; i < count; ++i) {
+            values[i] = static_cast<float>(Luminance(pixels.data() + i * 4));
+        }
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t i = static_cast<size_t>(y) * width + x;
+                const float oldValue = std::clamp(values[i], 0.0f, 255.0f);
+                const float newValue = oldValue < 128.0f ? 0.0f : 255.0f;
+                const float error = oldValue - newValue;
+                values[i] = newValue;
+                if (x + 1 < width) values[i + 1] += error * 7.0f / 16.0f;
+                if (y + 1 < height) {
+                    if (x > 0) values[i + width - 1] += error * 3.0f / 16.0f;
+                    values[i + width] += error * 5.0f / 16.0f;
+                    if (x + 1 < width) values[i + width + 1] += error * 1.0f / 16.0f;
+                }
+            }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            BYTE* p = pixels.data() + i * 4;
+            const BYTE v = values[i] < 128.0f ? 0 : 255;
+            p[0] = p[1] = p[2] = v;
+        }
+        return;
+    }
+
+    if (mode == ColorMode::Bayer4x4 || mode == ColorMode::Binary) {
+        static constexpr int bayer[4][4] = {
+            {0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}
+        };
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t i = static_cast<size_t>(y) * width + x;
+                const BYTE gray = Luminance(pixels.data() + i * 4);
+                const int threshold = mode == ColorMode::Binary
+                    ? 128
+                    : bayer[y & 3][x & 3] * 16 + 8;
+                BYTE* p = pixels.data() + i * 4;
+                const BYTE v = gray >= threshold ? 255 : 0;
+                p[0] = p[1] = p[2] = v;
+            }
+        }
+    }
+}
+
 class Stream {
     HINTERNET session_ = nullptr;
     HINTERNET connect_ = nullptr;
@@ -1210,16 +1288,17 @@ int wmain(
         SetProcessDPIAware();
     }
 
-    if (argc >= 2 && argc < 5) {
+    if (argc >= 2 && argc < 6) {
         std::vector<std::wstring> fixedArgs;
         for (int i = 0; i < argc; ++i) {
             fixedArgs.push_back(argv[i]);
         }
 
-        while (fixedArgs.size() < 5) {
+        while (fixedArgs.size() < 6) {
             if (fixedArgs.size() == 2) fixedArgs.push_back(L"30");
             else if (fixedArgs.size() == 3) fixedArgs.push_back(L"1");
             else if (fixedArgs.size() == 4) fixedArgs.push_back(L"0");
+            else if (fixedArgs.size() == 5) fixedArgs.push_back(L"0");
         }
 
         std::vector<wchar_t*> fixedArgv;
@@ -1335,6 +1414,11 @@ int wmain(
                 ? ParseUnsigned(argv[4])
                 : 0;
 
+        const uint64_t colorModeValue =
+            argc > 5
+                ? ParseUnsigned(argv[5])
+                : 0;
+
         if (fps == 0 || fps > 1000) {
             throw std::runtime_error(
                 "fps must be between 1 and 1000");
@@ -1366,12 +1450,19 @@ int wmain(
                 "rotation must be 0, 90, 180, or 270 degrees");
         }
 
+        if (colorModeValue > static_cast<uint64_t>(ColorMode::Binary)) {
+            throw std::runtime_error(
+                "color mode must be between 0 and 5");
+        }
+        const ColorMode colorMode = static_cast<ColorMode>(colorModeValue);
+
         std::wcout << L"Configuration:\n"
                    << L"  URL: " << url << L"\n"
                    << L"  Framebuffer: " << fb.w << L"x" << fb.h << L"\n"
                    << L"  FPS: " << fps << L"\n"
                    << L"  Monitor: " << monitorIndex << L"\n"
                    << L"  Rotation: " << rotation << L"\n"
+                   << L"  Color mode: " << colorModeValue << L"\n"
                    << L"Starting transmission..." << std::endl;
 
         Capture capture;
@@ -1481,8 +1572,22 @@ int wmain(
                 continue;
             }
 
+            const BYTE* pixels = capture.Pixels();
+            std::vector<BYTE> processedPixels;
+            if (colorMode != ColorMode::Auto && colorMode != ColorMode::Color) {
+                const size_t pixelBytes =
+                    static_cast<size_t>(capture.Width()) * capture.Height() * 4;
+                processedPixels.assign(pixels, pixels + pixelBytes);
+                ApplyColorMode(
+                    processedPixels,
+                    capture.Width(),
+                    capture.Height(),
+                    colorMode);
+                pixels = processedPixels.data();
+            }
+
             if (!encoder.Encode(
-                    capture.Pixels(),
+                    pixels,
                     capture.Width(),
                     capture.Height(),
                     capture.Stride(),
@@ -1528,3 +1633,5 @@ int wmain(
         return 1;
     }
 }
+
+
