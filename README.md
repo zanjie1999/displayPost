@@ -1,6 +1,8 @@
 # 工作咩闹钟 做Window电脑显示器的上位机
 
-可以将任意显示器画面同步到任意Linux设备上，比如 Buildroot的智能音箱，Kindle，KVM或路由器上的小屏幕
+可以将任意显示器画面同步到任意Linux设备上，比如 Buildroot的智能音箱，Kindle，KVM或路由器上的小屏幕  
+无需任何依赖，直接写drm或fb  
+只需要电脑5%的CPU和2%的GPU，远低于Sunshine和Spacedesk
 
 ## 如何使用
 直接双击运行也行
