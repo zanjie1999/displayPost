@@ -723,13 +723,19 @@ class Capture {
     ID3D11DeviceContext* context_ = nullptr;
     IDXGIOutputDuplication* duplication_ = nullptr;
     ID3D11Texture2D* staging_ = nullptr;
-    int outputLeft_ = 0, outputTop_ = 0, outputWidth_ = 0, outputHeight_ = 0;
+    int outputLeft_ = 0, outputTop_ = 0;
+    int outputWidth_ = 0, outputHeight_ = 0;
+    int frameWidth_ = 0, frameHeight_ = 0;
+    DXGI_MODE_ROTATION outputRotation_ = DXGI_MODE_ROTATION_UNSPECIFIED;
 
     void ReleaseDuplication() {
         if (staging_) { staging_->Release(); staging_ = nullptr; }
         if (duplication_) { duplication_->Release(); duplication_ = nullptr; }
         if (context_) { context_->Release(); context_ = nullptr; }
         if (device_) { device_->Release(); device_ = nullptr; }
+        frameWidth_ = 0;
+        frameHeight_ = 0;
+        outputRotation_ = DXGI_MODE_ROTATION_UNSPECIFIED;
     }
 
     bool OpenOutput(const RECT& source) {
@@ -759,14 +765,27 @@ class Capture {
         if (output1) output1->Release(); output->Release(); adapter->Release(); factory->Release();
         if (FAILED(hr)) { if (ctx) ctx->Release(); if (dev) dev->Release(); return false; }
         DXGI_OUTDUPL_DESC dd{}; dup->GetDesc(&dd);
-        D3D11_TEXTURE2D_DESC td{}; td.Width = dd.ModeDesc.Width; td.Height = dd.ModeDesc.Height;
+        const bool quarterTurn =
+            dd.Rotation == DXGI_MODE_ROTATION_ROTATE90 ||
+            dd.Rotation == DXGI_MODE_ROTATION_ROTATE270;
+        const UINT frameWidth =
+            quarterTurn ? dd.ModeDesc.Height : dd.ModeDesc.Width;
+        const UINT frameHeight =
+            quarterTurn ? dd.ModeDesc.Width : dd.ModeDesc.Height;
+        D3D11_TEXTURE2D_DESC td{}; td.Width = frameWidth; td.Height = frameHeight;
         td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         ID3D11Texture2D* staging = nullptr;
         hr = dev->CreateTexture2D(&td, nullptr, &staging);
         if (FAILED(hr)) { dup->Release(); ctx->Release(); dev->Release(); return false; }
         device_ = dev; context_ = ctx; duplication_ = dup; staging_ = staging;
-        outputLeft_ = hit.left; outputTop_ = hit.top; outputWidth_ = (int)td.Width; outputHeight_ = (int)td.Height;
+        outputLeft_ = hit.left;
+        outputTop_ = hit.top;
+        outputWidth_ = hit.right - hit.left;
+        outputHeight_ = hit.bottom - hit.top;
+        frameWidth_ = static_cast<int>(frameWidth);
+        frameHeight_ = static_cast<int>(frameHeight);
+        outputRotation_ = dd.Rotation;
         return true;
     }
 
@@ -891,6 +910,14 @@ class Capture {
 public:
     ~Capture() { ReleaseDuplication(); }
 
+    void ResetOutput() {
+        ReleaseDuplication();
+        outputLeft_ = 0;
+        outputTop_ = 0;
+        outputWidth_ = 0;
+        outputHeight_ = 0;
+    }
+
     bool Init(const Fb& fb, int rotation) {
         fb_ = fb; rotation_ = rotation; pixels_.assign((size_t)fb.w * fb.h * 4, 0); return true;
     }
@@ -964,7 +991,30 @@ public:
             else if (rotation_ == 180) { ux = sourceWidth - 1 - (int)((long long)x * sourceWidth / contentWidth); uy = sourceHeight - 1 - (int)((long long)y * sourceHeight / contentHeight); }
             else if (rotation_ == 270) { ux = sourceWidth - 1 - (int)((long long)y * sourceWidth / contentHeight); uy = (int)((long long)x * sourceHeight / contentWidth); }
             else { ux = (int)((long long)x * sourceWidth / contentWidth); uy = (int)((long long)y * sourceHeight / contentHeight); }
-            int sx = source.left - outputLeft_ + ux, sy = source.top - outputTop_ + uy;
+            const int desktopX = source.left - outputLeft_ + ux;
+            const int desktopY = source.top - outputTop_ + uy;
+            int sx = desktopX;
+            int sy = desktopY;
+            switch (outputRotation_) {
+            case DXGI_MODE_ROTATION_ROTATE90:
+                sx = desktopY;
+                sy = frameHeight_ - 1 - desktopX;
+                break;
+            case DXGI_MODE_ROTATION_ROTATE180:
+                sx = frameWidth_ - 1 - desktopX;
+                sy = frameHeight_ - 1 - desktopY;
+                break;
+            case DXGI_MODE_ROTATION_ROTATE270:
+                sx = frameWidth_ - 1 - desktopY;
+                sy = desktopX;
+                break;
+            default:
+                break;
+            }
+            if (sx < 0 || sy < 0 || sx >= frameWidth_ || sy >= frameHeight_) {
+                context_->Unmap(staging_, 0);
+                return false;
+            }
             BYTE* q = pixels_.data() + ((size_t)(top+y)*fb_.w + left+x)*4;
             memcpy(q, src + (size_t)sy*srcStride + sx*4, 4);
         }
@@ -1699,16 +1749,43 @@ int wmain(
         int autoReconnectRetries = 0;
         bool forceReconnect = false;
 
-        const RECT monitorRect =
+        RECT monitorRect =
             monitors[
                 static_cast<size_t>(monitorIndex - 1)
             ].rect;
+
+        auto refreshMonitor = [&]() {
+            const std::vector<MonitorInfo> currentMonitors =
+                EnumerateMonitors();
+            if (currentMonitors.empty()) {
+                capture.ResetOutput();
+                std::cerr << "Unable to refresh monitor list: no Windows monitors found."
+                          << std::endl;
+                return false;
+            }
+
+            if (monitorIndex > currentMonitors.size()) {
+                monitorIndex = currentMonitors.size();
+            }
+            monitorRect =
+                currentMonitors[
+                    static_cast<size_t>(monitorIndex - 1)
+                ].rect;
+            capture.ResetOutput();
+            std::cout << "Refreshed monitor " << monitorIndex << ": "
+                      << monitorRect.right - monitorRect.left << "x"
+                      << monitorRect.bottom - monitorRect.top << " at ("
+                      << monitorRect.left << ", " << monitorRect.top << ")."
+                      << std::endl;
+            return true;
+        };
 
         for (;;) {
             if (_kbhit()) {
                 int ch = _getch();
                 if (ch == 13) {
                     std::cout << "Manual reconnect requested." << std::endl;
+                    refreshMonitor();
                     connected = false;
                     stream.Close();
                     interactiveRetries = 0;
@@ -1748,6 +1825,7 @@ int wmain(
                                       << std::endl;
                             std::wstring line;
                             std::getline(std::wcin, line);
+                            refreshMonitor();
                             interactiveRetries = 0;
                             forceReconnect = true;
                         } else {
