@@ -462,12 +462,7 @@ static Fb ParseFbInfo(const std::string& json) {
     return fb;
 }
 
-static Fb ReadFbInfo(const std::wstring& url) {
-    Url parts;
-    if (!Crack(url, parts)) {
-        throw std::runtime_error("bad URL");
-    }
-
+static Fb ReadFbInfo(Url& parts) {
     for (;;) {
         try {
             return ParseFbInfo(HttpGet(parts, L"/fbinfo"));
@@ -1076,6 +1071,7 @@ class Stream {
     HINTERNET session_ = nullptr;
     HINTERNET connect_ = nullptr;
     HINTERNET request_ = nullptr;
+    DWORD lastWriteError_ = ERROR_SUCCESS;
 
     bool WriteRaw(const void* data, size_t size) {
         const BYTE* p = static_cast<const BYTE*>(data);
@@ -1091,6 +1087,7 @@ class Stream {
                     p,
                     chunk,
                     nullptr)) {
+                lastWriteError_ = GetLastError();
                 return false;
             }
 
@@ -1150,11 +1147,65 @@ class Stream {
     }
 
 public:
+    DWORD LastWriteError() const {
+        return lastWriteError_;
+    }
+
+    bool ReadFailureResponse(
+        DWORD& statusCode,
+        std::wstring& location) {
+        if (!request_ || !WinHttpReceiveResponse(request_, nullptr)) {
+            return false;
+        }
+
+        DWORD statusCodeSize = sizeof(statusCode);
+        if (!WinHttpQueryHeaders(
+                request_,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &statusCode,
+                &statusCodeSize,
+                WINHTTP_NO_HEADER_INDEX)) {
+            return false;
+        }
+
+        DWORD locationSize = 0;
+        if (WinHttpQueryHeaders(
+                request_,
+                WINHTTP_QUERY_LOCATION,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                nullptr,
+                &locationSize,
+                WINHTTP_NO_HEADER_INDEX)) {
+            return true;
+        }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER ||
+            locationSize < sizeof(wchar_t)) {
+            return true;
+        }
+
+        std::vector<wchar_t> locationBuffer(
+            locationSize / sizeof(wchar_t));
+        if (!WinHttpQueryHeaders(
+                request_,
+                WINHTTP_QUERY_LOCATION,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                locationBuffer.data(),
+                &locationSize,
+                WINHTTP_NO_HEADER_INDEX)) {
+            return true;
+        }
+
+        location.assign(locationBuffer.data());
+        return true;
+    }
+
     void Close() {
         if (request_) {
             WinHttpCloseHandle(request_);
             request_ = nullptr;
         }
+        lastWriteError_ = ERROR_SUCCESS;
 
         if (connect_) {
             WinHttpCloseHandle(connect_);
@@ -1171,14 +1222,8 @@ public:
         Close();
     }
 
-    bool Open(const std::wstring& baseUrl) {
+    bool Open(Url& url) {
         Close();
-
-        Url url;
-
-        if (!Crack(baseUrl, url)) {
-            return false;
-        }
 
         const std::wstring path = JoinPath(
             url.path,
@@ -1542,6 +1587,10 @@ int wmain(
 
         try {
         const std::wstring url = NormalizeUrl(argv[1]);
+        Url activeUrl;
+        if (!Crack(url, activeUrl)) {
+            throw std::runtime_error("bad URL");
+        }
 
         const uint64_t fps =
             argc > 2
@@ -1578,7 +1627,7 @@ int wmain(
             monitorIndex = 1;
         }
 
-        const Fb fb = ReadFbInfo(url);
+        const Fb fb = ReadFbInfo(activeUrl);
 
         const std::vector<MonitorInfo> monitors =
             EnumerateMonitors();
@@ -1655,7 +1704,6 @@ int wmain(
                 static_cast<size_t>(monitorIndex - 1)
             ].rect;
 
-        std::cout << L"Press Enter to reconnect, Ctrl+C to stop.\n";
         for (;;) {
             if (_kbhit()) {
                 int ch = _getch();
@@ -1691,7 +1739,7 @@ int wmain(
                     }
                 }
 
-                connected = stream.Open(url);
+                connected = stream.Open(activeUrl);
                 if (!connected) {
                     if (interactiveMode) {
                         ++interactiveRetries;
@@ -1756,6 +1804,34 @@ int wmain(
 
             if (!stream.WriteFrame(jpeg)) {
                 connected = false;
+                DWORD httpStatus = 0;
+                std::wstring location;
+                bool portFallbackApplied = false;
+
+                if (stream.ReadFailureResponse(httpStatus, location) &&
+                    httpStatus >= 300) {
+                    Url redirected;
+                    if (!location.empty() && Crack(location, redirected)) {
+                        activeUrl = redirected;
+                        portFallbackApplied = true;
+                        std::wcout << L"Following HTTP redirect to "
+                                   << activeUrl.host << L":"
+                                   << activeUrl.port << activeUrl.path << L"\n";
+                    } else if (AdvancePortFallback(activeUrl)) {
+                        portFallbackApplied = true;
+                        std::wcout << L"HTTP status " << httpStatus
+                                   << L"; trying port "
+                                   << activeUrl.port << L".\n";
+                    }
+                }
+
+                if (!portFallbackApplied &&
+                    IsConnectionFailure(stream.LastWriteError()) &&
+                    AdvancePortFallback(activeUrl)) {
+                    std::wcout << L"WinHTTP write connection error; trying port "
+                               << activeUrl.port << L".\n";
+                }
+
                 stream.Close();
                 if (!interactiveMode) {
                     ++autoReconnectRetries;
