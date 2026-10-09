@@ -11,7 +11,7 @@
 displayPost.exe <url> [fps=30] [monitor=1] [rotation=0] [quality=90] [color=0]
 ```
 
-- `url`: 工作咩闹钟Web后台地址，比如 `http://192.168.1.154:8080`
+- `url`: 工作咩闹钟Web后台地址，比如 `http://192.168.1.154:8080`,而Android端，端口和Web后台不同，是`8880`，比如 `http://192.168.1.154:8880`
 - `fps`: 每秒帧率，默认 `30`
 - `monitor`: Windows的显示器编号，默认 `1`
 - `rotation`: 屏幕旋转，0/90/180/270，默认不转
@@ -22,4 +22,3 @@ displayPost.exe <url> [fps=30] [monitor=1] [rotation=0] [quality=90] [color=0]
 ```cmd
 displayPost.exe http://192.168.2.195:8080/ 30 1 90 75
 ```
-

@@ -54,10 +54,75 @@ struct Url {
     std::wstring path;
     INTERNET_PORT port = 0;
     bool tls = false;
+    bool portSpecified = false;
 };
 
 // Set when the executable was launched without command-line parameters.
 static bool gInteractiveLaunch = false;
+
+static bool HasExplicitPort(const std::wstring& url) {
+    const size_t schemeEnd = url.find(L"://");
+    const size_t authorityBegin =
+        schemeEnd == std::wstring::npos ? 0 : schemeEnd + 3;
+    const size_t authorityEnd =
+        url.find_first_of(L"/?#", authorityBegin);
+    std::wstring authority = url.substr(
+        authorityBegin,
+        authorityEnd == std::wstring::npos
+            ? std::wstring::npos
+            : authorityEnd - authorityBegin);
+
+    const size_t userInfoEnd = authority.rfind(L'@');
+    if (userInfoEnd != std::wstring::npos) {
+        authority.erase(0, userInfoEnd + 1);
+    }
+
+    size_t portSeparator = std::wstring::npos;
+    if (!authority.empty() && authority.front() == L'[') {
+        const size_t hostEnd = authority.find(L']');
+        if (hostEnd != std::wstring::npos &&
+            hostEnd + 1 < authority.size() &&
+            authority[hostEnd + 1] == L':') {
+            portSeparator = hostEnd + 1;
+        }
+    } else {
+        portSeparator = authority.rfind(L':');
+    }
+
+    if (portSeparator == std::wstring::npos ||
+        portSeparator + 1 == authority.size()) {
+        return false;
+    }
+
+    return std::all_of(
+        authority.begin() + portSeparator + 1,
+        authority.end(),
+        [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+}
+
+static bool IsConnectionFailure(DWORD error) {
+    return error == ERROR_WINHTTP_CANNOT_CONNECT ||
+           error == ERROR_WINHTTP_CONNECTION_ERROR ||
+           error == ERROR_WINHTTP_TIMEOUT;
+}
+
+static bool AdvancePortFallback(Url& url) {
+    if (url.tls) {
+        return false;
+    }
+
+    if (!url.portSpecified && url.port == INTERNET_DEFAULT_HTTP_PORT) {
+        url.port = 8080;
+    } else if (url.port == 8080) {
+        url.port = 8880;
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+static std::wstring NormalizeUrl(std::wstring url);
 
 static bool Crack(const std::wstring& input, Url& out) {
     URL_COMPONENTS components{};
@@ -66,13 +131,14 @@ static bool Crack(const std::wstring& input, Url& out) {
     wchar_t host[256]{};
     wchar_t path[4096]{};
 
+    const std::wstring fullUrl = NormalizeUrl(input);
     components.lpszHostName = host;
     components.dwHostNameLength = _countof(host);
     components.lpszUrlPath = path;
     components.dwUrlPathLength = _countof(path);
 
     if (!WinHttpCrackUrl(
-            input.c_str(),
+            fullUrl.c_str(),
             0,
             0,
             &components)) {
@@ -97,6 +163,7 @@ static bool Crack(const std::wstring& input, Url& out) {
 
     out.port = components.nPort;
     out.tls = components.nScheme == INTERNET_SCHEME_HTTPS;
+    out.portSpecified = HasExplicitPort(fullUrl);
     return true;
 }
 
@@ -173,118 +240,148 @@ static std::string ReadString(
 }
 
 static std::string HttpGet(
-    const std::wstring& baseUrl,
+    Url& url,
     const std::wstring& relativePath) {
 
-    Url url;
-
-    if (!Crack(baseUrl, url)) {
-        throw std::runtime_error("bad URL");
-    }
-
-    HINTERNET session = WinHttpOpen(
-        L"displayPost/0.5",
-        WINHTTP_ACCESS_TYPE_NO_PROXY,
-        nullptr,
-        nullptr,
-        0);
-
-    if (!session) {
-        throw std::runtime_error("WinHttpOpen failed");
-    }
-
-    HINTERNET connect = nullptr;
-    HINTERNET request = nullptr;
-
-    try {
-        connect = WinHttpConnect(
-            session,
-            url.host.c_str(),
-            url.port,
+    for (;;) {
+        DWORD failureError = ERROR_SUCCESS;
+        HINTERNET session = WinHttpOpen(
+            L"displayPost/0.5",
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            nullptr,
+            nullptr,
             0);
 
-        if (!connect) {
-            throw std::runtime_error("WinHttpConnect failed");
+        if (!session) {
+            failureError = GetLastError();
+            if (IsConnectionFailure(failureError) &&
+                AdvancePortFallback(url)) {
+                std::wcerr << L"Cannot connect; trying port "
+                           << url.port << L".\n";
+                continue;
+            }
+            throw std::runtime_error("WinHttpOpen failed");
         }
 
-        const std::wstring requestPath =
-            JoinPath(url.path, relativePath);
+        HINTERNET connect = nullptr;
+        HINTERNET request = nullptr;
 
-        request = WinHttpOpenRequest(
-            connect,
-            L"GET",
-            requestPath.c_str(),
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            url.tls ? WINHTTP_FLAG_SECURE : 0);
+        try {
+            connect = WinHttpConnect(
+                session,
+                url.host.c_str(),
+                url.port,
+                0);
 
-        if (!request) {
-            throw std::runtime_error(
-                "WinHttpOpenRequest failed");
-        }
+            if (!connect) {
+                failureError = GetLastError();
+                throw std::runtime_error("WinHttpConnect failed");
+            }
 
-        if (!WinHttpSendRequest(
-                request,
+            const std::wstring requestPath =
+                JoinPath(url.path, relativePath);
+
+            request = WinHttpOpenRequest(
+                connect,
+                L"GET",
+                requestPath.c_str(),
                 nullptr,
-                0,
-                nullptr,
-                0,
-                0,
-                0)) {
-            throw std::runtime_error(
-                "GET WinHttpSendRequest failed");
-        }
+                WINHTTP_NO_REFERER,
+                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                url.tls ? WINHTTP_FLAG_SECURE : 0);
 
-        if (!WinHttpReceiveResponse(request, nullptr)) {
-            throw std::runtime_error(
-                "GET WinHttpReceiveResponse failed");
-        }
-
-        std::string result;
-        char buffer[8192];
-
-        for (;;) {
-            DWORD bytesRead = 0;
-
-            if (!WinHttpReadData(
-                    request,
-                    buffer,
-                    sizeof(buffer),
-                    &bytesRead)) {
+            if (!request) {
+                failureError = GetLastError();
                 throw std::runtime_error(
-                    "GET WinHttpReadData failed");
+                    "WinHttpOpenRequest failed");
             }
 
-            if (bytesRead == 0) {
-                break;
+            if (!WinHttpSendRequest(
+                    request,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    0,
+                    0)) {
+                failureError = GetLastError();
+                throw std::runtime_error(
+                    "GET WinHttpSendRequest failed");
             }
 
-            result.append(buffer, buffer + bytesRead);
-        }
+            if (!WinHttpReceiveResponse(request, nullptr)) {
+                failureError = GetLastError();
+                throw std::runtime_error(
+                    "GET WinHttpReceiveResponse failed");
+            }
 
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
+            DWORD statusCode = 0;
+            DWORD statusCodeSize = sizeof(statusCode);
+            if (!WinHttpQueryHeaders(
+                    request,
+                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX,
+                    &statusCode,
+                    &statusCodeSize,
+                    WINHTTP_NO_HEADER_INDEX)) {
+                failureError = GetLastError();
+                throw std::runtime_error(
+                    "GET WinHttpQueryHeaders failed");
+            }
+            if (statusCode < 200 || statusCode >= 300) {
+                throw std::runtime_error(
+                    "GET HTTP status " + std::to_string(statusCode));
+            }
 
-        return result;
+            std::string result;
+            char buffer[8192];
 
-    } catch (...) {
-        if (request) {
+            for (;;) {
+                DWORD bytesRead = 0;
+
+                if (!WinHttpReadData(
+                        request,
+                        buffer,
+                        sizeof(buffer),
+                        &bytesRead)) {
+                    failureError = GetLastError();
+                    throw std::runtime_error(
+                        "GET WinHttpReadData failed");
+                }
+
+                if (bytesRead == 0) {
+                    break;
+                }
+
+                result.append(buffer, buffer + bytesRead);
+            }
+
             WinHttpCloseHandle(request);
-        }
-        if (connect) {
             WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return result;
+
+        } catch (...) {
+            if (request) {
+                WinHttpCloseHandle(request);
+            }
+            if (connect) {
+                WinHttpCloseHandle(connect);
+            }
+            WinHttpCloseHandle(session);
+
+            if (IsConnectionFailure(failureError) &&
+                AdvancePortFallback(url)) {
+                std::wcerr << L"Cannot connect; trying port "
+                           << url.port << L".\n";
+                continue;
+            }
+            throw;
         }
-        WinHttpCloseHandle(session);
-        throw;
     }
 }
 
-static Fb ReadFbInfo(const std::wstring& url) {
-    const std::string json =
-        HttpGet(url, L"/fbinfo");
-
+static Fb ParseFbInfo(const std::string& json) {
     Fb fb;
 
     fb.w = static_cast<int>(
@@ -363,6 +460,25 @@ static Fb ReadFbInfo(const std::wstring& url) {
     }
 
     return fb;
+}
+
+static Fb ReadFbInfo(const std::wstring& url) {
+    Url parts;
+    if (!Crack(url, parts)) {
+        throw std::runtime_error("bad URL");
+    }
+
+    for (;;) {
+        try {
+            return ParseFbInfo(HttpGet(parts, L"/fbinfo"));
+        } catch (const std::exception&) {
+            if (!AdvancePortFallback(parts)) {
+                throw;
+            }
+            std::wcerr << L"fbinfo request or response was invalid; "
+                       << L"trying port " << parts.port << L".\n";
+        }
+    }
 }
 
 struct MonitorInfo {
@@ -1064,52 +1180,9 @@ public:
             return false;
         }
 
-        session_ = WinHttpOpen(
-            L"displayPost/0.6",
-            WINHTTP_ACCESS_TYPE_NO_PROXY,
-            nullptr,
-            nullptr,
-            0);
-
-        if (!session_) {
-            return false;
-        }
-
-        WinHttpSetTimeouts(
-            session_,
-            5000,
-            5000,
-            5000,
-            5000);
-
-        connect_ = WinHttpConnect(
-            session_,
-            url.host.c_str(),
-            url.port,
-            0);
-
-        if (!connect_) {
-            return false;
-        }
-
         const std::wstring path = JoinPath(
             url.path,
             L"/fb");
-
-        request_ = WinHttpOpenRequest(
-            connect_,
-            L"POST",
-            path.c_str(),
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            url.tls
-                ? WINHTTP_FLAG_SECURE
-                : 0);
-
-        if (!request_) {
-            return false;
-        }
 
         /*
             This is the same HTTP streaming mechanism used by
@@ -1120,39 +1193,88 @@ public:
         static const wchar_t transferEncoding[] =
             L"Transfer-Encoding: chunked\r\n";
 
-        if (!WinHttpAddRequestHeaders(
-                request_,
-                transferEncoding,
-                static_cast<DWORD>(-1),
-                WINHTTP_ADDREQ_FLAG_ADD)) {
-            return false;
-        }
-
         static const wchar_t contentType[] =
             L"Content-Type: multipart/x-mixed-replace; "
             L"boundary=ffmpeg\r\n"
             L"Expect:\r\n";
 
-        if (!WinHttpAddRequestHeaders(
-                request_,
-                contentType,
-                static_cast<DWORD>(-1),
-                WINHTTP_ADDREQ_FLAG_ADD)) {
-            return false;
-        }
-
         /*
             Unknown total length because the stream is continuous.
             The actual HTTP chunks are written by WriteChunk().
         */
-        return WinHttpSendRequest(
-                   request_,
-                   WINHTTP_NO_ADDITIONAL_HEADERS,
-                   0,
-                   WINHTTP_NO_REQUEST_DATA,
-                   0,
-                   WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
-                   0) != FALSE;
+        for (;;) {
+            DWORD failureError = ERROR_SUCCESS;
+            session_ = WinHttpOpen(
+                L"displayPost/0.6",
+                WINHTTP_ACCESS_TYPE_NO_PROXY,
+                nullptr,
+                nullptr,
+                0);
+
+            if (!session_) {
+                failureError = GetLastError();
+            } else {
+                WinHttpSetTimeouts(
+                    session_,
+                    5000,
+                    5000,
+                    5000,
+                    5000);
+
+                connect_ = WinHttpConnect(
+                    session_,
+                    url.host.c_str(),
+                    url.port,
+                    0);
+                if (!connect_) {
+                    failureError = GetLastError();
+                } else {
+                    request_ = WinHttpOpenRequest(
+                        connect_,
+                        L"POST",
+                        path.c_str(),
+                        nullptr,
+                        WINHTTP_NO_REFERER,
+                        WINHTTP_DEFAULT_ACCEPT_TYPES,
+                        url.tls ? WINHTTP_FLAG_SECURE : 0);
+                    if (!request_) {
+                        failureError = GetLastError();
+                    } else if (!WinHttpAddRequestHeaders(
+                                   request_,
+                                   transferEncoding,
+                                   static_cast<DWORD>(-1),
+                                   WINHTTP_ADDREQ_FLAG_ADD)) {
+                        failureError = GetLastError();
+                    } else if (!WinHttpAddRequestHeaders(
+                                   request_,
+                                   contentType,
+                                   static_cast<DWORD>(-1),
+                                   WINHTTP_ADDREQ_FLAG_ADD)) {
+                        failureError = GetLastError();
+                    } else if (WinHttpSendRequest(
+                                   request_,
+                                   WINHTTP_NO_ADDITIONAL_HEADERS,
+                                   0,
+                                   WINHTTP_NO_REQUEST_DATA,
+                                   0,
+                                   WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
+                                   0)) {
+                        return true;
+                    } else {
+                        failureError = GetLastError();
+                    }
+                }
+            }
+
+            Close();
+            if (IsConnectionFailure(failureError) &&
+                AdvancePortFallback(url)) {
+                std::wcerr << L"Cannot connect; trying port "
+                           << url.port << L".\n";
+                continue;
+            }
+            return false;
+        }
     }
 
     bool WriteFrame(const std::vector<BYTE>& jpeg) {
@@ -1364,8 +1486,8 @@ int wmain(
         if (rotationInput.empty()) {
             rotationInput = L"0";
         }
-        // std::wcout << L"JPEG quality (0-100, default 75): ";
-        // std::getline(std::wcin, qualityInput);
+        std::wcout << L"quality (0-100, default 75): ";
+        std::getline(std::wcin, qualityInput);
         if (qualityInput.empty()) {
             qualityInput = L"75";
         }
@@ -1394,22 +1516,31 @@ int wmain(
             interactiveArgs.data());
     }
 
-    const HRESULT comResult =
-        CoInitializeEx(
-            nullptr,
-            COINIT_MULTITHREADED);
+    for (;;) {
+        const HRESULT comResult =
+            CoInitializeEx(
+                nullptr,
+                COINIT_MULTITHREADED);
 
-    const bool comInitialized =
-        SUCCEEDED(comResult);
+        const bool comInitialized =
+            SUCCEEDED(comResult);
 
-    if (FAILED(comResult) &&
-        comResult != RPC_E_CHANGED_MODE) {
-        std::cerr
-            << "error: CoInitializeEx failed\n";
-        return 1;
-    }
+        if (FAILED(comResult) &&
+            comResult != RPC_E_CHANGED_MODE) {
+            std::cerr
+                << "error: CoInitializeEx failed\n";
+            if (!gInteractiveLaunch) {
+                return 1;
+            }
+            std::wcerr << L"Press Enter to retry.\n";
+            std::wstring line;
+            if (!std::getline(std::wcin, line)) {
+                return 1;
+            }
+            continue;
+        }
 
-    try {
+        try {
         const std::wstring url = NormalizeUrl(argv[1]);
 
         const uint64_t fps =
@@ -1524,6 +1655,7 @@ int wmain(
                 static_cast<size_t>(monitorIndex - 1)
             ].rect;
 
+        std::cout << L"Press Enter to reconnect, Ctrl+C to stop.\n";
         for (;;) {
             if (_kbhit()) {
                 int ch = _getch();
@@ -1646,17 +1778,39 @@ int wmain(
 
         return 0;
 
-    } catch (const std::exception& e) {
-        std::cerr
-            << "error: "
-            << e.what()
-            << "\n";
+        } catch (const std::exception& e) {
+            std::cerr
+                << "error: "
+                << e.what()
+                << "\n";
 
-        if (comInitialized) {
-            CoUninitialize();
+            if (comInitialized) {
+                CoUninitialize();
+            }
+
+            if (!gInteractiveLaunch) {
+                return 1;
+            }
+            std::wcerr << L"Press Enter to retry.\n";
+            std::wstring line;
+            if (!std::getline(std::wcin, line)) {
+                return 1;
+            }
+        } catch (...) {
+            std::cerr << "error: unknown failure\n";
+
+            if (comInitialized) {
+                CoUninitialize();
+            }
+
+            if (!gInteractiveLaunch) {
+                return 1;
+            }
+            std::wcerr << L"Press Enter to retry.\n";
+            std::wstring line;
+            if (!std::getline(std::wcin, line)) {
+                return 1;
+            }
         }
-
-        return 1;
     }
 }
-
