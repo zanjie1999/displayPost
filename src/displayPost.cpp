@@ -1047,6 +1047,7 @@ enum class ColorMode : uint64_t {
     FloydSteinberg = 3,
     Bayer4x4 = 4,
     Binary = 5,
+    FourInOne = 6,
 };
 
 static BYTE Luminance(const BYTE* pixel) {
@@ -1586,7 +1587,7 @@ int wmain(
         if (qualityInput.empty()) {
             qualityInput = L"75";
         }
-        // std::wcout << L"color mode (0-5, default 0): ";
+        // std::wcout << L"color mode (0-6, default 0): ";
         // std::getline(std::wcin, colorModeInput);
         if (colorModeInput.empty()) {
             colorModeInput = L"0";
@@ -1677,7 +1678,7 @@ int wmain(
             monitorIndex = 1;
         }
 
-        const Fb fb = ReadFbInfo(activeUrl);
+        Fb fb = ReadFbInfo(activeUrl);
 
         const std::vector<MonitorInfo> monitors =
             EnumerateMonitors();
@@ -1704,11 +1705,19 @@ int wmain(
                 "JPEG quality must be between 0 and 100");
         }
 
-        if (colorModeValue > static_cast<uint64_t>(ColorMode::Binary)) {
+        if (colorModeValue > static_cast<uint64_t>(ColorMode::FourInOne)) {
             throw std::runtime_error(
-                "color mode must be between 0 and 5");
+                "color mode must be between 0 and 6");
         }
         const ColorMode colorMode = static_cast<ColorMode>(colorModeValue);
+        if (colorMode == ColorMode::FourInOne) {
+            if (fb.w < 2 || fb.h < 2) {
+                throw std::runtime_error(
+                    "color mode 6 requires framebuffer width and height of at least 2");
+            }
+            fb.w /= 2;
+            fb.h /= 2;
+        }
 
         std::wcout << L"Configuration:\n"
                    << L"  URL: " << url << L"\n"
@@ -1857,7 +1866,9 @@ int wmain(
 
             const BYTE* pixels = capture.Pixels();
             std::vector<BYTE> processedPixels;
-            if (colorMode != ColorMode::Auto && colorMode != ColorMode::Color) {
+            if (colorMode != ColorMode::Auto &&
+                colorMode != ColorMode::Color &&
+                colorMode != ColorMode::FourInOne) {
                 const size_t pixelBytes =
                     static_cast<size_t>(capture.Width()) * capture.Height() * 4;
                 processedPixels.assign(pixels, pixels + pixelBytes);

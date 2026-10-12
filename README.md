@@ -16,7 +16,7 @@ displayPost.exe <url> [fps=30] [monitor=1] [rotation=0] [quality=90] [color=0]
 - `monitor`: Windows的显示器编号，默认 `1`
 - `rotation`: 屏幕旋转，0/90/180/270，默认不转
 - `quality`: JPEG图像质量，范围 `0` 到 `100`，默认 `75`
-- `color`: 色彩处理模式：0 自动（默认），1 彩色，2 灰度，3 Floyd-Steinberg 黑白抖动，4 Bayer 4x4 黑白抖动，5 二值化黑白
+- `color`: 色彩处理模式：0 自动（默认），1 彩色，2 灰度，3 Floyd-Steinberg 黑白抖动，4 Bayer 4x4 黑白抖动，5 二值化黑白，6 四合一（宽、高各缩小为fbinfo的一半）
 
 比如:
 ```cmd
