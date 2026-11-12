@@ -55,6 +55,7 @@ struct Url {
     INTERNET_PORT port = 0;
     bool tls = false;
     bool portSpecified = false;
+    bool portLocked = false;
 };
 
 // Set when the executable was launched without command-line parameters.
@@ -107,6 +108,10 @@ static bool IsConnectionFailure(DWORD error) {
 }
 
 static bool AdvancePortFallback(Url& url) {
+    if (url.portLocked) {
+        return false;
+    }
+
     if (url.tls) {
         return false;
     }
@@ -1754,6 +1759,7 @@ int wmain(
         bool connected = false;
         bool everConnected = false;
         auto nextReconnect = std::chrono::steady_clock::now();
+        auto connectedSince = std::chrono::steady_clock::now();
         int interactiveRetries = 0;
         int autoReconnectRetries = 0;
         bool forceReconnect = false;
@@ -1857,6 +1863,13 @@ int wmain(
                 forceReconnect = false;
                 std::cout << "Connected. Transmission started." << std::endl;
                 nextFrame = std::chrono::steady_clock::now();
+                connectedSince = std::chrono::steady_clock::now();
+            }
+
+            if (connected && !activeUrl.portLocked &&
+                std::chrono::steady_clock::now() - connectedSince >=
+                    std::chrono::seconds(10)) {
+                activeUrl.portLocked = true;
             }
 
             if (!capture.CaptureFrame(monitorRect)) {
@@ -1901,6 +1914,7 @@ int wmain(
                     httpStatus >= 300) {
                     Url redirected;
                     if (!location.empty() && Crack(location, redirected)) {
+                        redirected.portLocked = activeUrl.portLocked;
                         activeUrl = redirected;
                         portFallbackApplied = true;
                         std::wcout << L"Following HTTP redirect to "
